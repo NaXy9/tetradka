@@ -5,7 +5,7 @@ title = "Tetradka gitleaks config"
 useDefault = true
 
 [allowlist]
-description = "Examples, stubs and docs — no real secrets live here (§11)."
+description = "Examples, stubs and docs — no real secrets live here."
 paths = [
     '''\.env\.example$''',
     '''prompts/.*\.example\..*''',

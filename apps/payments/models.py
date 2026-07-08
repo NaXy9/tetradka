@@ -1,8 +1,8 @@
 # Tetradka — Copyright (c) 2026 Igor Pryanikov
 # Licensed under PolyForm Noncommercial License 1.0.0 (see LICENSE).
-"""Payments: hold → capture flow, tutor payout accounts and payouts (§5).
+"""Payments: hold → capture flow, tutor payout accounts and payouts.
 
-Money invariant (§3): hold on booking → capture after completed → 10% commission
+Money invariant: hold on booking → capture after completed → 10% commission
 (5% for Pro) → tutor balance. Commission is computed in ONE place:
 payments/services.py::calc_commission(). Capture and the balance credit happen
 in a single transaction.
@@ -43,7 +43,7 @@ class Payment(TimeStampedModel):
         ordering = ["-created_at"]
         indexes = [models.Index(fields=["status"])]
         constraints = [
-            # Idempotency anchor for provider webhooks (§8): one row per provider event id.
+            # Idempotency anchor for provider webhooks: one row per provider event id.
             models.UniqueConstraint(
                 fields=["provider", "provider_id"],
                 condition=~models.Q(provider_id=""),

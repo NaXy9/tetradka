@@ -1,4 +1,4 @@
-"""Catalog: subjects and public tutor profiles (§5)."""
+"""Catalog: subjects and public tutor profiles."""
 
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
@@ -8,7 +8,7 @@ from apps.common.models import TimeStampedModel
 
 
 class Subject(models.Model):
-    """A teachable subject (математика, python, английский...)."""
+    """A teachable subject (math, python, english, ...)."""
 
     name = models.CharField(max_length=100, unique=True)
     slug = models.SlugField(max_length=100, unique=True)
@@ -21,7 +21,7 @@ class Subject(models.Model):
 
 
 class TutorProfile(TimeStampedModel):
-    """Tutor's public profile. Rating and lessons_count are denormalized (§5)."""
+    """Tutor's public profile. Rating and lessons_count are denormalized."""
 
     user = models.OneToOneField(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="tutor_profile"
@@ -35,15 +35,15 @@ class TutorProfile(TimeStampedModel):
     education = models.TextField(blank=True)
     is_verified = models.BooleanField(default=False)
     # Refund percentage when a student cancels less than 24h before the lesson
-    # (>24h is always a full refund — invariant §5). 0 = no refund.
+    # (cancelling more than 24h before the lesson always refunds 100%). 0 = no refund.
     late_cancellation_refund_percent = models.PositiveSmallIntegerField(
         default=0, validators=[MaxValueValidator(100)]
     )
     # Denormalized from Review / completed bookings; recalculated by services.
     rating = models.DecimalField(max_digits=3, decimal_places=2, default=0)
     lessons_count = models.PositiveIntegerField(default=0)
-    # Earnings after commission, credited on capture (invariant §3: capture and
-    # balance credit happen in one transaction). Withdrawn via Payout.
+    # Earnings after commission, credited when the payment is captured (the capture
+    # and this balance credit happen in one DB transaction). Withdrawn via Payout.
     balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
 
     subjects = models.ManyToManyField(Subject, through="TutorSubject", related_name="tutors")
@@ -61,7 +61,7 @@ class TutorProfile(TimeStampedModel):
 
 
 class TutorSubject(models.Model):
-    """M2M tutor↔subject with a teaching level (ЕГЭ, ОГЭ, разговорный...)."""
+    """M2M tutor↔subject with a teaching level (exam prep, conversational, ...)."""
 
     tutor = models.ForeignKey(TutorProfile, on_delete=models.CASCADE, related_name="tutor_subjects")
     subject = models.ForeignKey(Subject, on_delete=models.CASCADE, related_name="tutor_subjects")

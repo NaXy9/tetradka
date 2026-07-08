@@ -1,7 +1,7 @@
 """Base settings shared across environments.
 
 Service addresses and secrets come from the environment only (no localhost hardcoded
-in code, §14). Safe non-network defaults (SQLite, in-memory broker/cache) let the project
+in code). Safe non-network defaults (SQLite, in-memory broker/cache) let the project
 boot and run its test suite without any external services.
 """
 
@@ -72,7 +72,7 @@ TEMPLATES = [
     },
 ]
 
-# --- Database (all times stored in UTC, §5) -----------------------------------
+# --- Database (all times stored in UTC) -----------------------------------
 if env("DATABASE_URL", default=""):
     DATABASES = {"default": env.db("DATABASE_URL")}
 else:
@@ -92,7 +92,7 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
-# --- I18n / timezone: store UTC, render in the user's tz at the edges (§5) -----
+# --- I18n / timezone: store UTC, render in the user's tz at the edges -----
 LANGUAGE_CODE = "ru"
 TIME_ZONE = "UTC"
 USE_I18N = True
@@ -129,7 +129,7 @@ SPECTACULAR_SETTINGS = {
     "SERVE_INCLUDE_SCHEMA": False,
 }
 
-# --- Celery: named queues for future horizontal split (§14) -------------------
+# --- Celery: named queues for future horizontal split -------------------
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="memory://")
 CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default="cache+memory://")
 CELERY_TIMEZONE = "UTC"

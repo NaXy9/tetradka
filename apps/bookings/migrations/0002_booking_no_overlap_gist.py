@@ -1,6 +1,6 @@
 # Tetradka — Copyright (c) 2026 Igor Pryanikov
 # Licensed under PolyForm Noncommercial License 1.0.0 (see LICENSE).
-"""Last line of defense against double booking (invariant §5, CLAUDE.md #1).
+"""Last line of defense against double booking.
 
 PostgreSQL-only: btree_gist extension + GiST exclusion constraint forbidding
 overlapping [starts_at, ends_at) ranges per tutor while a booking is active

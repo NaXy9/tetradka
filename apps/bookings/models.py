@@ -1,6 +1,6 @@
 # Tetradka — Copyright (c) 2026 Igor Pryanikov
 # Licensed under PolyForm Noncommercial License 1.0.0 (see LICENSE).
-"""Booking domain: availability, bookings with a strict status machine, reviews (§5).
+"""Booking domain: availability, bookings with a strict status machine, reviews.
 
 All datetimes are stored in UTC. AvailabilityRule/Exception are the only place
 where the tutor's local timezone appears: rules are expanded into concrete UTC
@@ -86,7 +86,7 @@ class InvalidStatusTransition(Exception):
 
 
 class Booking(TimeStampedModel):
-    """A student's booked slot with a tutor. starts_at/ends_at are UTC (invariant §5)."""
+    """A student's booked slot with a tutor. starts_at/ends_at are UTC."""
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending payment"
@@ -141,7 +141,7 @@ class Booking(TimeStampedModel):
         return f"Booking#{self.pk} {self.status} {self.starts_at:%Y-%m-%d %H:%M}"
 
     def transition_to(self, new_status: str, *, actor=None, reason: str = "") -> None:
-        """Move along one edge of the status machine; log who/when/why (booking-domain).
+        """Move along one edge of the status machine and record an audit log entry.
 
         Locks the row first: concurrent transitions (payment webhook vs. Celery
         pending-timeout) must serialize, so the edge check runs against the

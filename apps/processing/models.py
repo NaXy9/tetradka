@@ -1,9 +1,9 @@
 # Tetradka — Copyright (c) 2026 Igor Pryanikov
 # Licensed under PolyForm Noncommercial License 1.0.0 (see LICENSE).
-"""AI pipeline artifacts: transcript (Whisper) and summary (LLM) per recording (§5).
+"""AI pipeline artifacts: transcript (Whisper) and summary (LLM) per recording.
 
-Pipeline statuses must be visible in admin (§8). Real LLM prompts never live in
-this repo (§11) — providers load them from env/private config.
+Pipeline statuses must be visible in admin. Real LLM prompts never live in
+this repo — providers load them from env/private config.
 """
 
 from django.db import models

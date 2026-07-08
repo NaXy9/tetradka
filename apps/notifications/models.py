@@ -1,4 +1,4 @@
-"""In-app/push notifications (§5): type + payload, read state."""
+"""In-app/push notifications: type + payload, read state."""
 
 from django.conf import settings
 from django.db import models

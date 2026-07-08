@@ -1,6 +1,6 @@
 # Tetradka — Copyright (c) 2026 Igor Pryanikov
 # Licensed under PolyForm Noncommercial License 1.0.0 (see LICENSE).
-"""Payment model constraints: webhook idempotency anchor (§8)."""
+"""Payment model constraints: webhook idempotency anchor."""
 
 import pytest
 from django.db import transaction

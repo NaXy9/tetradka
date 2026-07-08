@@ -1,4 +1,4 @@
-"""Lessons: the LiveKit room bound to a booking, and its server-side recordings (§5)."""
+"""Lessons: the LiveKit room bound to a booking, and its server-side recordings."""
 
 from django.db import models
 
@@ -6,7 +6,7 @@ from apps.common.models import TimeStampedModel
 
 
 class Lesson(TimeStampedModel):
-    """1-1 with a confirmed Booking. Consent flags are the legal basis for recording (§9)."""
+    """1-1 with a confirmed Booking. Consent flags are the legal basis for recording."""
 
     booking = models.OneToOneField(
         "bookings.Booking", on_delete=models.PROTECT, related_name="lesson"
@@ -22,7 +22,7 @@ class Lesson(TimeStampedModel):
 
 
 class Recording(TimeStampedModel):
-    """Egress output stored in S3/MinIO. Retention 30 days → expires_at (§9)."""
+    """Egress output stored in S3/MinIO. Retention 30 days → expires_at."""
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"  # egress started, file not delivered yet

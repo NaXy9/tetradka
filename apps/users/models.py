@@ -1,4 +1,4 @@
-"""Custom user: email login, IANA timezone, Expo push token (§5)."""
+"""Custom user: email login, IANA timezone, Expo push token."""
 
 from django.contrib.auth.models import AbstractUser
 from django.db import models
@@ -15,7 +15,7 @@ class User(AbstractUser):
     timezone = models.CharField(max_length=64, default="UTC")
     # Expo push token for lesson reminders and the "notes are ready" push (Stage 3).
     push_token = models.CharField(max_length=255, blank=True)
-    # Storage key of the avatar object in S3/MinIO (media never touches local disk, §14).
+    # Storage key of the avatar object in S3/MinIO (media never touches local disk).
     avatar_key = models.CharField(max_length=255, blank=True)
 
     USERNAME_FIELD = "email"

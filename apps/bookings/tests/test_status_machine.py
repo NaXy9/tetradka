@@ -1,4 +1,4 @@
-"""Booking status machine: only the edges from the diagram are legal (booking-domain)."""
+"""Booking status machine: only the explicitly allowed transitions are legal."""
 
 import pytest
 from django.db.utils import IntegrityError
