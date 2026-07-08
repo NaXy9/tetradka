@@ -69,6 +69,7 @@ def expand_availability(
     crossing "fall back" grows by the repeated hour, and a window that lies
     entirely inside the gap disappears (see _local_to_utc for edge mapping).
     Returns clipped, sorted (start_utc, end_utc) tuples.
+    Raises ValueError if `start` or `end` is naive.
     """
     if start.utcoffset() is None or end.utcoffset() is None:
         raise ValueError("start and end must be timezone-aware")
@@ -140,6 +141,10 @@ def create_booking(
     requests for the same tutor serialize and the overlap check sees committed
     state; the GiST exclusion constraint in PostgreSQL remains the last line of
     defense should any code path bypass this function.
+
+    Returns the created pending Booking with the price derived from the tutor's
+    current hourly rate. Raises SlotUnavailableError when the slot cannot be
+    booked and ValueError on naive or inverted datetimes.
     """
     if starts_at.utcoffset() is None or ends_at.utcoffset() is None:
         raise ValueError("starts_at and ends_at must be timezone-aware")

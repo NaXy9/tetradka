@@ -146,6 +146,9 @@ class Booking(TimeStampedModel):
         Locks the row first: concurrent transitions (payment webhook vs. Celery
         pending-timeout) must serialize, so the edge check runs against the
         committed status, not a stale in-memory one.
+
+        Raises InvalidStatusTransition if the current status has no edge to
+        `new_status`, and ValueError if `new_status` is not a valid Status.
         """
         new_status = self.Status(new_status)
         with transaction.atomic():

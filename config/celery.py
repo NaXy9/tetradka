@@ -1,3 +1,5 @@
+"""Celery application entry point (`celery -A config worker/beat`)."""
+
 import os
 
 from celery import Celery
