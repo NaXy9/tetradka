@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements/*.txt
+      - run: pip install -r requirements/dev.txt
+      - run: ruff check .
+      - run: black --check .
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: tetradka_test
+          POSTGRES_USER: tetradka
+          POSTGRES_PASSWORD: tetradka
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tetradka"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DJANGO_SETTINGS_MODULE: config.settings.test
+      # PostgreSQL DSN enables @pytest.mark.postgres tests (GiST exclusion
+      # constraint, row-level locking) that are skipped on SQLite.
+      TETRADKA_TEST_DATABASE_URL: postgres://tetradka:tetradka@localhost:5432/tetradka_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements/*.txt
+      - run: pip install -r requirements/dev.txt
+      - run: pytest -q --cov=apps --cov-report=term-missing
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t tetradka-backend .
+      # compose services reference env_file: .env, so provide the example one
+      - run: cp .env.example .env
+      - run: docker compose config -q
+        env:
+          COMPOSE_PROFILES: app,video,worker
