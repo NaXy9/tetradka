@@ -1,0 +1,30 @@
+[project]
+name = "tetradka"
+version = "0.1.0"
+description = "Tutoring marketplace with built-in video lessons, server-side recording and AI lesson notes."
+requires-python = ">=3.13"
+license = { text = "PolyForm-Noncommercial-1.0.0" }
+authors = [{ name = "Igor Pryanikov" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["."]
+extend-exclude = ["*/migrations/*", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "DJ"]
+ignore = [
+    "SIM105", # contextlib.suppress over try/except/pass — noisy for readability
+]
+
+[tool.ruff.lint.per-file-ignores]
+"config/settings/*" = ["F403", "F405"] # star-imports across settings layers are intentional
+
+[tool.ruff.lint.isort]
+known-first-party = ["apps", "config"]
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+extend-exclude = "/migrations/"
