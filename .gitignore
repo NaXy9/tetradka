@@ -25,10 +25,11 @@ local_settings.py
 .env
 .env.*
 !.env.example
+!.env.production.example
 *.pem
 secrets/
 
-# --- Real (non-stub) AI prompts — the "secret sauce" (§11) ---
+# --- Real (non-stub) AI prompts — the "secret sauce" ---
 prompts/*.txt
 !prompts/*.example.txt
 

@@ -1,0 +1,175 @@
+# Tetradka — Copyright (c) 2026 Igor Pryanikov
+# Licensed under PolyForm Noncommercial License 1.0.0 (see LICENSE).
+#
+# Compose profiles let every machine run only its slice of the stack with the
+# same file:
+#   app    — Django API (postgres/redis/minio have no profile and always start)
+#   video  — LiveKit SFU + Egress (recording)
+#   worker — Celery worker (default/media/gpu queues) + beat scheduler
+# Dev: COMPOSE_PROFILES=app,video,worker in .env, so `docker compose up -d`
+# starts everything. Prod: the same file with .env.production, no Kubernetes.
+
+name: tetradka
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: tetradka
+      POSTGRES_USER: tetradka
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tetradka}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tetradka -d tetradka"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin} &&
+      mc mb --ignore-existing local/${S3_BUCKET_RECORDINGS:-tetradka-recordings} &&
+      mc ilm rule add --expire-days ${RECORDING_RETENTION_DAYS:-30} local/${S3_BUCKET_RECORDINGS:-tetradka-recordings} || true
+      "
+
+  web:
+    profiles: [app]
+    build: .
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    profiles: [worker]
+    build: .
+    # A single worker listens to all queues while everything runs on one server.
+    # When processing moves to a separate machine, only -Q changes (e.g. media,gpu).
+    command: celery -A config worker -l info -Q ${CELERY_QUEUES:-default,media,gpu}
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$HOSTNAME --timeout 10"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+  beat:
+    profiles: [worker]
+    build: .
+    command: celery -A config beat -l info
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  livekit:
+    profiles: [video]
+    image: livekit/livekit-server:latest
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        rtc:
+          tcp_port: 7881
+          # Narrow UDP range for dev: mapping 10k ports is heavy on Docker Desktop.
+          # On a production Linux VPS use network_mode: host with 50000-60000.
+          port_range_start: 50000
+          port_range_end: 50100
+          use_external_ip: false
+        redis:
+          address: redis:6379
+        keys:
+          ${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-devsecret_change_me_at_least_32_chars}
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7880"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  egress:
+    profiles: [video]
+    image: livekit/egress:latest
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      EGRESS_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY:-devkey}
+        api_secret: ${LIVEKIT_API_SECRET:-devsecret_change_me_at_least_32_chars}
+        ws_url: ws://livekit:7880
+        redis:
+          address: redis:6379
+        s3:
+          access_key: ${S3_ACCESS_KEY:-minioadmin}
+          secret: ${S3_SECRET_KEY:-minioadmin}
+          endpoint: ${S3_ENDPOINT_URL:-http://minio:9000}
+          bucket: ${S3_BUCKET_RECORDINGS:-tetradka-recordings}
+          region: ${S3_REGION:-us-east-1}
+          force_path_style: true
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+      minio:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  minio-data:
