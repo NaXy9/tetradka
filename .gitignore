@@ -61,7 +61,7 @@ postgres-data/
 .DS_Store
 Thumbs.db
 
-# --- AI-assistant working files (personal, not committed) ---
+# --- AI-assistant working files and internal docs (personal, not committed) ---
 .claude/
 CLAUDE.md
-docs/PROGRESS.md
+docs/
