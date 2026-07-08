@@ -1,0 +1,66 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.Python
+
+# --- Virtualenv ---
+.venv/
+venv/
+env/
+
+# --- Django ---
+*.log
+db.sqlite3
+db.sqlite3-journal
+/staticfiles/
+/mediafiles/
+local_settings.py
+
+# --- Env & secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+secrets/
+
+# --- Real (non-stub) AI prompts — the "secret sauce" (§11) ---
+prompts/*.txt
+!prompts/*.example.txt
+
+# --- Tests & coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- Tooling caches ---
+.ruff_cache/
+.mypy_cache/
+
+# --- Node / mobile (added in later stages) ---
+node_modules/
+.expo/
+*.tsbuildinfo
+
+# --- Docker / data volumes ---
+.docker/
+minio-data/
+postgres-data/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- AI-assistant working files (personal, not committed) ---
+.claude/
+CLAUDE.md
+docs/PROGRESS.md

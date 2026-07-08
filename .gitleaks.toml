@@ -1,0 +1,14 @@
+title = "Tetradka gitleaks config"
+
+# Build on gitleaks' default ruleset, then allow known-safe example/stub files.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Examples, stubs and docs — no real secrets live here (§11)."
+paths = [
+    '''\.env\.example$''',
+    '''prompts/.*\.example\..*''',
+    '''deploy/.*''',
+    '''docs/.*''',
+]
