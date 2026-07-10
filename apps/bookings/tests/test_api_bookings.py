@@ -268,9 +268,16 @@ def test_status_filter():
 def test_role_and_status_filters_combine():
     tutor, subject = bookable_tutor()
     both = tutor.user
-    wanted = BookingFactory(tutor=tutor, subject=subject, status=S.CONFIRMED)
-    BookingFactory(tutor=tutor, subject=subject, status=S.PENDING)  # wrong status
-    BookingFactory(student=both, status=S.CONFIRMED)  # wrong role
+    # Two same-tutor bookings must sit in distinct slots: the PostgreSQL
+    # exclusion constraint forbids overlapping active bookings for one tutor.
+    s1, e1 = slot(days=3)
+    s2, e2 = slot(days=4)
+    wanted = BookingFactory(
+        tutor=tutor, subject=subject, status=S.CONFIRMED, starts_at=s1, ends_at=e1
+    )
+    # Wrong status, and parked in another slot so it does not clash with `wanted`.
+    BookingFactory(tutor=tutor, subject=subject, status=S.PENDING, starts_at=s2, ends_at=e2)
+    BookingFactory(student=both, status=S.CONFIRMED)  # wrong role, its own tutor
     client, _ = auth_client(user=both)
 
     ids = [
