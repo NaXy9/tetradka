@@ -120,6 +120,13 @@ REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    # Scoped rates for public (unauthenticated) endpoints; counters live in the
+    # default cache (Redis in prod, so limits are shared across workers).
+    "DEFAULT_THROTTLE_RATES": {
+        # Registration is limited per client IP to block mass account creation
+        # and to slow down email enumeration.
+        "auth.register": "10/hour",
+    },
 }
 
 SPECTACULAR_SETTINGS = {
