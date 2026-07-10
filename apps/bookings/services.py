@@ -112,6 +112,53 @@ def expand_availability(
     return sorted(intervals)
 
 
+def free_slots(
+    tutor: TutorProfile, start: dt.datetime, end: dt.datetime
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    """Return the tutor's bookable UTC intervals within [start, end).
+
+    Availability (see expand_availability) minus the time already taken by active
+    (pending/confirmed) bookings: each availability interval has the overlapping
+    bookings cut out of it, leaving the remaining free sub-intervals. Cancelled
+    and completed bookings free their time up again. `start`/`end` must be aware.
+    Returns sorted, non-overlapping (start_utc, end_utc) tuples.
+    Raises ValueError if `start` or `end` is naive (propagated from expand_availability).
+    """
+    intervals = expand_availability(tutor, start, end)
+    if not intervals:
+        return []
+
+    # Only active bookings block a slot; ordered by start so a single forward
+    # pass can subtract them from each availability interval.
+    busy = list(
+        Booking.objects.filter(
+            tutor=tutor,
+            status__in=(Booking.Status.PENDING, Booking.Status.CONFIRMED),
+            starts_at__lt=end,
+            ends_at__gt=start,
+        )
+        .order_by("starts_at")
+        .values_list("starts_at", "ends_at")
+    )
+    if not busy:
+        return intervals
+
+    free: list[tuple[dt.datetime, dt.datetime]] = []
+    for interval_start, interval_end in intervals:
+        cursor = interval_start
+        for booking_start, booking_end in busy:
+            if booking_end <= cursor or booking_start >= interval_end:
+                continue  # booking does not touch the unconsumed part of this interval
+            if booking_start > cursor:
+                free.append((cursor, booking_start))
+            cursor = max(cursor, booking_end)
+            if cursor >= interval_end:
+                break
+        if cursor < interval_end:
+            free.append((cursor, interval_end))
+    return free
+
+
 def _covers(tutor: TutorProfile, starts_at: dt.datetime, ends_at: dt.datetime) -> bool:
     """Whether [starts_at, ends_at) lies entirely within the tutor's availability."""
     covered_until = starts_at

@@ -13,6 +13,13 @@ class SubjectSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "slug"]
 
 
+class SlotSerializer(serializers.Serializer):
+    """One free UTC interval of a tutor's availability; rendered in the client's tz."""
+
+    starts_at = serializers.DateTimeField()
+    ends_at = serializers.DateTimeField()
+
+
 class TutorSubjectSerializer(serializers.ModelSerializer):
     """A subject the tutor teaches, with the teaching level of that row."""
 
