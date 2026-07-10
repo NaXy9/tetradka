@@ -10,4 +10,5 @@ urlpatterns = [
     path("auth/token/refresh", TokenRefreshView.as_view(), name="token_refresh"),
     path("", include("apps.users.urls")),
     path("", include("apps.catalog.urls")),
+    path("", include("apps.bookings.urls")),
 ]
