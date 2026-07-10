@@ -45,6 +45,18 @@ class TestAvailabilityConstraints:
                 end_time=None,
             )
 
+    def test_duplicate_exception_date_rejected(self):
+        # expand_availability honours one override per date; the unique constraint
+        # keeps a second row for the same (tutor, date) out of the table.
+        tutor = TutorProfileFactory()
+        AvailabilityException.objects.create(tutor=tutor, date=dt.date(2026, 7, 20))
+        with pytest.raises(IntegrityError):
+            AvailabilityException.objects.create(tutor=tutor, date=dt.date(2026, 7, 20))
+
+    def test_same_date_other_tutor_allowed(self):
+        AvailabilityException.objects.create(tutor=TutorProfileFactory(), date=dt.date(2026, 7, 20))
+        AvailabilityException.objects.create(tutor=TutorProfileFactory(), date=dt.date(2026, 7, 20))
+
     def test_valid_rule_and_exception_pass(self):
         tutor = TutorProfileFactory()
         AvailabilityRule.objects.create(

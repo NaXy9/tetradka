@@ -74,6 +74,12 @@ class AvailabilityException(TimeStampedModel):
                 ),
                 name="availability_exception_window_valid",
             ),
+            # expand_availability keys exceptions by date and honours one override
+            # per date, so a second row for the same date would silently shadow the
+            # first; keep the model incapable of representing that.
+            models.UniqueConstraint(
+                fields=["tutor", "date"], name="uniq_availability_exception_tutor_date"
+            ),
         ]
 
     def __str__(self) -> str:

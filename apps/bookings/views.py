@@ -1,18 +1,24 @@
 # Tetradka — Copyright (c) 2026 Igor Pryanikov
 # Licensed under PolyForm Noncommercial License 1.0.0 (see LICENSE).
-"""Booking API: create a booking and list the caller's own bookings."""
+"""Booking API: bookings for either party plus the tutor's own availability CRUD."""
 
+from django.db import transaction
 from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
-from rest_framework import generics, status
+from rest_framework import generics, status, viewsets
 from rest_framework.exceptions import APIException
 from rest_framework.request import Request
 from rest_framework.response import Response
 
+from apps.catalog.models import TutorProfile
+from apps.common.permissions import IsTutor
+
 from .filters import BookingFilter
-from .models import Booking
+from .models import AvailabilityException, AvailabilityRule, Booking
 from .serializers import (
+    AvailabilityExceptionSerializer,
+    AvailabilityRuleSerializer,
     BookingCancelRequestSerializer,
     BookingCancelSerializer,
     BookingCreateSerializer,
@@ -113,3 +119,69 @@ class BookingCancelView(generics.GenericAPIView):
             raise CancelConflict(str(exc)) from exc
         booking.refund_amount = refund
         return Response(self.get_serializer(booking).data)
+
+
+class _OwnAvailabilityViewSet(viewsets.ModelViewSet):
+    """Shared base for a tutor's self-service availability collections.
+
+    Every action is scoped to the caller's own profile, so another tutor's row
+    id is a 404 (never a 403 that would confirm it exists), and `tutor` is set
+    from the request user on create rather than trusted from the body. The
+    weekly-schedule editor loads the whole collection at once, hence no
+    pagination.
+    """
+
+    permission_classes = [IsTutor]
+    pagination_class = None
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["tutor"] = self.request.user.tutor_profile
+        return context
+
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        with transaction.atomic():
+            self._lock_own_profile()
+            return super().create(request, *args, **kwargs)
+
+    def update(self, request: Request, *args, **kwargs) -> Response:
+        with transaction.atomic():
+            self._lock_own_profile()
+            return super().update(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        serializer.save(tutor=self.request.user.tutor_profile)
+
+    def _lock_own_profile(self) -> None:
+        """Serialize a tutor's concurrent availability writes on their profile row.
+
+        Availability has no DB range/exclusion constraint, so two concurrent
+        creates could each pass the serializer's overlap/duplicate-date check
+        against stale state and both commit. Locking the profile row makes the
+        check-then-write see committed state, the same guarantee create_booking
+        gets from its select_for_update. A no-op on SQLite; the real
+        serialization point on PostgreSQL.
+        """
+        TutorProfile.objects.select_for_update().get(pk=self.request.user.tutor_profile.pk)
+
+
+class AvailabilityRuleViewSet(_OwnAvailabilityViewSet):
+    """CRUD under /tutor/availability/rules for recurring weekly windows."""
+
+    serializer_class = AvailabilityRuleSerializer
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):  # schema generation has no user
+            return AvailabilityRule.objects.none()
+        return AvailabilityRule.objects.filter(tutor=self.request.user.tutor_profile)
+
+
+class AvailabilityExceptionViewSet(_OwnAvailabilityViewSet):
+    """CRUD under /tutor/availability/exceptions for one-off date overrides."""
+
+    serializer_class = AvailabilityExceptionSerializer
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):  # schema generation has no user
+            return AvailabilityException.objects.none()
+        return AvailabilityException.objects.filter(tutor=self.request.user.tutor_profile)
