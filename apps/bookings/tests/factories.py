@@ -5,7 +5,7 @@ import datetime as dt
 import factory
 from django.utils import timezone
 
-from apps.bookings.models import Booking
+from apps.bookings.models import Booking, Review
 from apps.catalog.models import Subject, TutorProfile
 from apps.users.models import User
 
@@ -48,3 +48,14 @@ class BookingFactory(factory.django.DjangoModelFactory):
     )
     ends_at = factory.LazyAttribute(lambda o: o.starts_at + dt.timedelta(hours=1))
     price = 1500
+
+
+class ReviewFactory(factory.django.DjangoModelFactory):
+    class Meta:
+        model = Review
+
+    # Reviews only exist for completed lessons; status is set directly because
+    # walking the pending→confirmed→completed machine is irrelevant here.
+    booking = factory.SubFactory(BookingFactory, status=Booking.Status.COMPLETED)
+    rating = 5
+    text = factory.Sequence(lambda n: f"Review text {n}")

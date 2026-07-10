@@ -31,6 +31,7 @@ INSTALLED_APPS = [
     # third-party
     "rest_framework",
     "drf_spectacular",
+    "django_filters",
     # local
     "apps.common",
     "apps.users",
@@ -120,6 +121,8 @@ REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    # API-wide convention: full-text search query param is ?q= (not DRF's ?search=).
+    "SEARCH_PARAM": "q",
     # Scoped rates for public (unauthenticated) endpoints; counters live in the
     # default cache (Redis in prod, so limits are shared across workers).
     "DEFAULT_THROTTLE_RATES": {
