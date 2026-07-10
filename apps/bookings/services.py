@@ -17,7 +17,7 @@ from django.utils import timezone
 from apps.catalog.models import Subject, TutorProfile
 from apps.users.models import User
 
-from .models import Booking
+from .models import Booking, InvalidStatusTransition
 
 UTC = dt.UTC
 
@@ -25,9 +25,17 @@ UTC = dt.UTC
 # booking that begins in a few minutes.
 MIN_BOOKING_LEAD = dt.timedelta(hours=2)
 
+# Cancelling more than this far ahead of the lesson refunds the student in full;
+# closer than that, the tutor's late-cancellation policy applies.
+CANCELLATION_FULL_REFUND_WINDOW = dt.timedelta(hours=24)
+
 
 class SlotUnavailableError(Exception):
     """The requested interval cannot be booked (taken, outside availability, or too soon)."""
+
+
+class BookingNotCancellableError(Exception):
+    """The booking is in a status that has no cancellation edge (already cancelled/completed)."""
 
 
 def _local_to_utc(day: dt.date, time_: dt.time, tz: ZoneInfo) -> dt.datetime:
@@ -228,3 +236,54 @@ def create_booking(
             ends_at=ends_at,
             price=price,
         )
+
+
+def _refund_amount(booking: Booking, target_status: str, now: dt.datetime) -> Decimal:
+    """Refund owed to the student for a cancellation, following the refund policy.
+
+    A tutor-initiated cancellation always refunds the full price. A student who
+    cancels earlier than CANCELLATION_FULL_REFUND_WINDOW before the lesson is
+    also refunded in full; closer than that, only the tutor's configured
+    late-cancellation percentage is returned.
+    """
+    if target_status == Booking.Status.CANCELLED_BY_TUTOR:
+        return booking.price
+    if booking.starts_at - now > CANCELLATION_FULL_REFUND_WINDOW:
+        return booking.price
+    percent = Decimal(booking.tutor.late_cancellation_refund_percent)
+    return (booking.price * percent / Decimal(100)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+
+
+def cancel_booking(*, booking: Booking, actor: User, reason: str = "") -> Decimal:
+    """Cancel a booking on behalf of one of its parties and return the refund owed.
+
+    The target status is chosen from the actor's side of the booking (student →
+    cancelled_by_student, tutor → cancelled_by_tutor), and the move goes through
+    the status machine, so the row is locked, the edge is validated against
+    committed state, and the transition is audit-logged. Concurrent cancellations
+    therefore serialize: the loser sees an already-cancelled booking and fails.
+
+    Only the refund amount is computed here; moving the money is the payment
+    layer's job and is wired in once holds are captured on booking. Until then
+    the amount is advisory — for a still-pending (unpaid) booking it is what
+    *would* be owed, not money actually taken.
+
+    Returns the refund amount owed to the student. Raises BookingNotCancellableError
+    when the actor is not a party to the booking or the booking's current status
+    has no cancellation edge.
+    """
+    if actor.id == booking.student_id:
+        target = Booking.Status.CANCELLED_BY_STUDENT
+    elif actor.id == booking.tutor.user_id:
+        target = Booking.Status.CANCELLED_BY_TUTOR
+    else:
+        raise BookingNotCancellableError("only a party to the booking may cancel it")
+
+    try:
+        booking.transition_to(target, actor=actor, reason=reason)
+    except InvalidStatusTransition as exc:
+        raise BookingNotCancellableError(str(exc)) from exc
+
+    return _refund_amount(booking, target, timezone.now())

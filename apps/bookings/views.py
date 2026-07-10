@@ -12,8 +12,18 @@ from rest_framework.response import Response
 
 from .filters import BookingFilter
 from .models import Booking
-from .serializers import BookingCreateSerializer, BookingSerializer
-from .services import SlotUnavailableError, create_booking
+from .serializers import (
+    BookingCancelRequestSerializer,
+    BookingCancelSerializer,
+    BookingCreateSerializer,
+    BookingSerializer,
+)
+from .services import (
+    BookingNotCancellableError,
+    SlotUnavailableError,
+    cancel_booking,
+    create_booking,
+)
 
 
 class SlotConflict(APIException):
@@ -27,6 +37,14 @@ class SlotConflict(APIException):
     status_code = status.HTTP_409_CONFLICT
     default_detail = "The requested slot cannot be booked."
     default_code = "slot_conflict"
+
+
+class CancelConflict(APIException):
+    """409 for a booking that cannot be cancelled from its current status."""
+
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "The booking cannot be cancelled."
+    default_code = "cancel_conflict"
 
 
 class BookingListCreateView(generics.ListCreateAPIView):
@@ -65,3 +83,33 @@ class BookingListCreateView(generics.ListCreateAPIView):
         except SlotUnavailableError as exc:
             raise SlotConflict(str(exc)) from exc
         return Response(BookingSerializer(booking).data, status=status.HTTP_201_CREATED)
+
+
+class BookingCancelView(generics.GenericAPIView):
+    """POST /bookings/{id}/cancel — either party cancels; response carries the refund."""
+
+    serializer_class = BookingCancelSerializer
+
+    def get_queryset(self):
+        # Scoped to the caller's own bookings so a stranger's id is a 404, not a
+        # 403 that would leak its existence — matching the list endpoint's scope.
+        user = self.request.user
+        return Booking.objects.filter(Q(student=user) | Q(tutor__user=user)).select_related(
+            "tutor__user", "subject", "student"
+        )
+
+    @extend_schema(request=BookingCancelRequestSerializer, responses={200: BookingCancelSerializer})
+    def post(self, request: Request, *args, **kwargs) -> Response:
+        booking = self.get_object()
+        request_serializer = BookingCancelRequestSerializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+        try:
+            refund = cancel_booking(
+                booking=booking,
+                actor=request.user,
+                reason=request_serializer.validated_data["reason"],
+            )
+        except BookingNotCancellableError as exc:
+            raise CancelConflict(str(exc)) from exc
+        booking.refund_amount = refund
+        return Response(self.get_serializer(booking).data)

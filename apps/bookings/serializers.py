@@ -69,6 +69,23 @@ class BookingSerializer(serializers.ModelSerializer):
         ]
 
 
+class BookingCancelRequestSerializer(serializers.Serializer):
+    """POST /bookings/{id}/cancel payload: an optional free-text audit reason."""
+
+    # Capped to the audit log's reason column so an over-long note is a 400, not
+    # a silent truncation.
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=255, default="")
+
+
+class BookingCancelSerializer(BookingSerializer):
+    """Cancellation response: the updated booking plus the refund owed to the student."""
+
+    refund_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+
+    class Meta(BookingSerializer.Meta):
+        fields = [*BookingSerializer.Meta.fields, "refund_amount"]
+
+
 class BookingCreateSerializer(serializers.Serializer):
     """POST /bookings payload. The slot's validity (availability, overlap, lead
     time) and price are decided by create_booking under a row lock; this
