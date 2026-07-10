@@ -150,3 +150,12 @@ CELERY_TASK_QUEUES = {
     "gpu": {},  # transcription
 }
 CELERY_TASK_ROUTES: dict[str, dict] = {}
+
+# Periodic jobs (run by `celery -A config beat`). Sweeping every minute keeps the
+# 15-minute pending-payment timeout tight without polling the DB aggressively.
+CELERY_BEAT_SCHEDULE = {
+    "expire-pending-bookings": {
+        "task": "bookings.expire_pending_bookings",
+        "schedule": 60.0,
+    },
+}

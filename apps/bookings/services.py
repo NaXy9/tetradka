@@ -29,6 +29,10 @@ MIN_BOOKING_LEAD = dt.timedelta(hours=2)
 # closer than that, the tutor's late-cancellation policy applies.
 CANCELLATION_FULL_REFUND_WINDOW = dt.timedelta(hours=24)
 
+# A booking holds its slot only briefly while awaiting payment; left unpaid past
+# this window it is auto-cancelled so the slot returns to the pool.
+PENDING_PAYMENT_TIMEOUT = dt.timedelta(minutes=15)
+
 
 class SlotUnavailableError(Exception):
     """The requested interval cannot be booked (taken, outside availability, or too soon)."""
@@ -287,3 +291,42 @@ def cancel_booking(*, booking: Booking, actor: User, reason: str = "") -> Decima
         raise BookingNotCancellableError(str(exc)) from exc
 
     return _refund_amount(booking, target, timezone.now())
+
+
+def expire_pending_bookings(*, now: dt.datetime | None = None) -> int:
+    """Cancel bookings left unpaid past PENDING_PAYMENT_TIMEOUT and free their slots.
+
+    A booking created more than PENDING_PAYMENT_TIMEOUT ago and still awaiting
+    payment is treated as abandoned: it moves to cancelled_by_student (the
+    pending→timeout edge of the status machine), which releases the slot for
+    rebooking. Run periodically by Celery beat.
+
+    Each candidate is re-checked as still pending under a row lock before the
+    transition. This guards the race with a payment that confirms the booking
+    between the scan and the sweep: confirmed→cancelled_by_student is itself a
+    legal edge, so the status machine alone would happily cancel a just-paid
+    lesson; the pending re-check under the lock is what prevents that.
+
+    Returns the number of bookings cancelled.
+    """
+    now = now or timezone.now()
+    cutoff = now - PENDING_PAYMENT_TIMEOUT
+    stale_ids = list(
+        Booking.objects.filter(status=Booking.Status.PENDING, created_at__lt=cutoff).values_list(
+            "pk", flat=True
+        )
+    )
+
+    cancelled = 0
+    for pk in stale_ids:
+        with transaction.atomic():
+            booking = Booking.objects.select_for_update().get(pk=pk)
+            if booking.status != Booking.Status.PENDING:
+                continue  # confirmed or cancelled concurrently; leave it alone
+            booking.transition_to(
+                Booking.Status.CANCELLED_BY_STUDENT,
+                actor=None,  # system action; no human actor
+                reason="pending payment timeout",
+            )
+            cancelled += 1
+    return cancelled
