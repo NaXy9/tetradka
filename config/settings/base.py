@@ -151,6 +151,13 @@ CELERY_TASK_QUEUES = {
 }
 CELERY_TASK_ROUTES: dict[str, dict] = {}
 
+# At-least-once delivery: a task that dies mid-run (worker crash/OOM) is redelivered
+# instead of silently ACKed and lost. Every task here is written to be idempotent,
+# so a duplicate run is safe; this closes the window where a crash after an external
+# side effect (e.g. opening a PSP hold) but before the DB write would drop the write.
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+
 # Periodic jobs (run by `celery -A config beat`). Sweeping every minute keeps the
 # 15-minute pending-payment timeout tight without polling the DB aggressively.
 CELERY_BEAT_SCHEDULE = {
