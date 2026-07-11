@@ -19,6 +19,10 @@ CACHES = {
 CELERY_BROKER_URL = env("CELERY_BROKER_URL")
 CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND")
 
+# Required in prod: base.py keeps a dev-only default that must never sign or
+# verify real payment webhooks. No default here → prod refuses to boot without it.
+PAYMENT_WEBHOOK_SECRET = env("PAYMENT_WEBHOOK_SECRET")
+
 # --- Security ---
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_SSL_REDIRECT = env.bool("DJANGO_SECURE_SSL_REDIRECT", default=True)

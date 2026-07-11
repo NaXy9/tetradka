@@ -159,3 +159,10 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 60.0,
     },
 }
+
+# --- Payments -----------------------------------------------------------------
+# The PSP is hidden behind apps.payments.providers.PaymentProvider; dev and tests
+# use the mock. PAYMENT_WEBHOOK_SECRET signs/verifies webhook payloads (the mock
+# uses HMAC-SHA256 over the raw body); the real value is injected via env in prod.
+PAYMENT_PROVIDER = env("PAYMENT_PROVIDER", default="mock")
+PAYMENT_WEBHOOK_SECRET = env("PAYMENT_WEBHOOK_SECRET", default="dev-mock-webhook-secret")
