@@ -37,10 +37,11 @@ class Payment(TimeStampedModel):
 
     # The only legal edges of the payment lifecycle; captured/refunded/failed are
     # terminal here. held → refunded is a full release of a confirmed hold (tutor
-    # cancel, student > 24h, no-show); held → failed is a hold voided before it
-    # backed a lesson (provider decline, pending-payment timeout); held → captured
-    # takes the money (full on completion, partial on a late cancellation). A
-    # post-capture refund (captured → refunded) is deferred to the real provider.
+    # cancel, student > 24h, no-show); held → failed voids a hold that never
+    # captured — a provider decline, a pending-payment timeout, or an orphaned hold
+    # freed after its booking was cancelled; held → captured takes the money (full
+    # on completion, partial on a late cancellation). A post-capture refund
+    # (captured → refunded) is deferred to the real provider.
     ALLOWED_TRANSITIONS = {
         Status.CREATED: {Status.HELD, Status.FAILED},
         Status.HELD: {Status.CAPTURED, Status.REFUNDED, Status.FAILED},
@@ -171,6 +172,34 @@ class PaymentStatusTransition(models.Model):
 
     def __str__(self) -> str:
         return f"{self.payment_id}: {self.from_status} → {self.to_status}"
+
+
+class ProcessedWebhookEvent(models.Model):
+    """Inbox anchor that makes provider webhooks idempotent by event id.
+
+    A PSP redelivers the same event (at-least-once), possibly out of order, so the
+    handler records every event id it processes and drops any redelivery. Keyed by
+    (provider, event_id) — the PSP's own event identifier, NOT the payment — so two
+    distinct events about the same payment (hold, then capture) are each processed
+    once, while a duplicate of either is skipped.
+    """
+
+    provider = models.CharField(max_length=32, choices=Payment.Provider.choices)
+    event_id = models.CharField(max_length=255)
+    event_type = models.CharField(max_length=32)
+    payment = models.ForeignKey(Payment, on_delete=models.CASCADE, related_name="webhook_events")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider", "event_id"], name="uniq_processed_webhook_event"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"WebhookEvent<{self.provider}:{self.event_id} {self.event_type}>"
 
 
 class PayoutAccount(TimeStampedModel):

@@ -11,7 +11,8 @@ from django.utils import timezone
 from apps.bookings.models import Booking
 from apps.users.models import User
 
-from .models import Payment
+from .models import InvalidStatusTransition, Payment, ProcessedWebhookEvent
+from .providers.base import WebhookEvent, WebhookType
 from .providers.factory import get_payment_provider
 
 # Platform commission taken from the captured amount. Pro tutors get a reduced
@@ -181,3 +182,126 @@ def confirm_hold(payment: Payment, *, actor: User | None = None) -> None:
         booking.transition_to(Booking.Status.CONFIRMED, actor=actor, reason="payment held")
 
     payment.status = Payment.Status.HELD
+
+
+def handle_webhook_event(event: WebhookEvent) -> None:
+    """Apply a signature-verified provider webhook, idempotently by event id.
+
+    Idempotency is anchored on the PSP's ``event_id`` (recorded once in
+    ``ProcessedWebhookEvent``), never on the payment, so a redelivered event is
+    dropped while distinct events about the same payment are each processed. The
+    record and the domain change commit together: if applying the event fails, the
+    record rolls back too and the PSP's next redelivery reprocesses it.
+
+    An event whose ``provider_id`` matches no known payment is ignored and *not*
+    recorded — it is foreign traffic, or a callback that raced our own persistence
+    of the hold id (real PSPs confirm long after the hold opens, so this is
+    effectively foreign). Leaving it unanchored lets a genuine later redelivery be
+    picked up once the id is stored; the durable backstop for a hold whose
+    confirmation is never redelivered is provider-status reconciliation (a stuck
+    ``created`` payment polled against the PSP), owned by the reconciliation job.
+
+    Args:
+        event: The normalized, already-verified webhook event.
+    """
+    provider_name = settings.PAYMENT_PROVIDER
+    payment = Payment.objects.filter(provider=provider_name, provider_id=event.provider_id).first()
+    if payment is None:
+        return
+
+    with transaction.atomic():
+        # get_or_create runs its INSERT in a savepoint, so a concurrent duplicate
+        # delivery losing the unique race does not poison this transaction.
+        _, created = ProcessedWebhookEvent.objects.get_or_create(
+            provider=provider_name,
+            event_id=event.event_id,
+            defaults={"event_type": event.type, "payment": payment},
+        )
+        if not created:
+            return  # a redelivery of an event we have already applied
+
+        handler = _WEBHOOK_HANDLERS.get(event.type)
+        if handler is not None:
+            handler(payment)
+        # Types we do not act on yet (capture/refund echoes, which are authoritative
+        # on the server-initiated call's return) are still recorded, so a later
+        # redelivery is deduplicated once those flows exist.
+
+
+def _on_hold_succeeded(payment: Payment) -> None:
+    """Confirm an authorization: hold the payment and confirm its booking.
+
+    Resilient to a *late* success — one that lands after the booking already left
+    ``pending`` (timed out or was cancelled). Then the hold backs nothing, so the
+    payment is failed and the hold released rather than forcing a dead booking back
+    to confirmed. Idempotent on redelivery via confirm_hold.
+    """
+    try:
+        confirm_hold(payment)
+    except (HoldNotConfirmable, InvalidStatusTransition):
+        _fail_and_release(payment)
+
+
+def _fail_and_release(payment: Payment) -> None:
+    # The hold succeeded at the PSP but can no longer back this booking (it timed
+    # out or was cancelled). Void the payment and free the money. Both a `created`
+    # hold (never confirmed on our side) and a `held` one (confirmed, then the
+    # booking was cancelled without releasing it — a state the future orchestrator
+    # closes) reach `failed`; a payment already `failed` out-of-order just needs the
+    # release re-issued. Re-read under the row lock so the decision is made against
+    # committed state, not the snapshot taken before the transaction opened.
+    locked = Payment.objects.select_for_update().get(pk=payment.pk)
+    if locked.status in (Payment.Status.CREATED, Payment.Status.HELD):
+        locked.transition_to(Payment.Status.FAILED, reason="orphaned hold released")
+    elif locked.status != Payment.Status.FAILED:
+        return  # captured/refunded: the hold is already settled, nothing to free
+    # The release call goes through Celery after commit, like every other provider
+    # call, so a slow or failing PSP never blocks the webhook.
+    transaction.on_commit(lambda: _enqueue_release(payment.id))
+
+
+def _on_hold_failed(payment: Payment) -> None:
+    """Mark a declined authorization failed; the booking is left to time out.
+
+    Only a still-``created`` payment is failed: a hold that already confirmed is
+    not torn down by a stray or out-of-order failure, and a replay is a no-op. The
+    status is re-read under the row lock (not from the pre-transaction snapshot), so
+    a hold confirming concurrently cannot be flipped to failed through the otherwise
+    legal ``held → failed`` edge.
+    """
+    locked = Payment.objects.select_for_update().get(pk=payment.pk)
+    if locked.status == Payment.Status.CREATED:
+        locked.transition_to(Payment.Status.FAILED, reason="authorization declined")
+
+
+def request_release(payment_id: int) -> None:
+    """Ask the provider to void an orphaned hold; idempotent and safe to retry.
+
+    Called for a payment already marked ``failed`` whose hold nonetheless succeeded
+    at the PSP (a late success on a booking that is gone). Only a failed payment
+    that actually holds a provider authorization is released; the stable
+    idempotency_key lets a retried release de-duplicate PSP-side.
+
+    Raises:
+        PaymentProviderError: On a provider-side failure, so the task retries.
+    """
+    payment = Payment.objects.get(pk=payment_id)
+    if payment.status != Payment.Status.FAILED or not payment.provider_id:
+        return
+    provider = get_payment_provider()
+    provider.release(provider_id=payment.provider_id, idempotency_key=f"release-{payment.id}")
+
+
+def _enqueue_release(payment_id: int) -> None:
+    # Imported lazily: tasks import this module, so a top-level import would cycle.
+    from .tasks import release_hold
+
+    release_hold.delay(payment_id)
+
+
+# Only the hold lifecycle drives domain changes here; capture/refund reconciliation
+# arrives with the completion/refund flows.
+_WEBHOOK_HANDLERS = {
+    WebhookType.HOLD_SUCCEEDED: _on_hold_succeeded,
+    WebhookType.HOLD_FAILED: _on_hold_failed,
+}

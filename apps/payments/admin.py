@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Payment, Payout, PayoutAccount
+from .models import Payment, Payout, PayoutAccount, ProcessedWebhookEvent
 
 
 @admin.register(Payment)
@@ -19,3 +19,10 @@ class PayoutAccountAdmin(admin.ModelAdmin):
 class PayoutAdmin(admin.ModelAdmin):
     list_display = ("id", "tutor", "amount", "period_start", "period_end", "status")
     list_filter = ("status",)
+
+
+@admin.register(ProcessedWebhookEvent)
+class ProcessedWebhookEventAdmin(admin.ModelAdmin):
+    list_display = ("id", "provider", "event_id", "event_type", "payment", "created_at")
+    list_filter = ("provider", "event_type")
+    search_fields = ("event_id",)

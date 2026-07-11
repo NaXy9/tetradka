@@ -4,9 +4,10 @@
 
 from django.urls import path
 
-from .views import BookingPayView
+from .views import BookingPayView, PaymentWebhookView
 
 urlpatterns = [
-    # Booking-scoped, but owned by the payments app alongside the (future) webhook.
+    # Booking-scoped, but owned by the payments app alongside the webhook below.
     path("bookings/<int:pk>/pay", BookingPayView.as_view(), name="booking_pay"),
+    path("webhooks/payment", PaymentWebhookView.as_view(), name="payment_webhook"),
 ]
