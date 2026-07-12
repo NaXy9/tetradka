@@ -15,6 +15,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.catalog.models import Subject, TutorProfile
+from apps.payments.services import reconcile_booking_payment
 from apps.users.models import User
 
 from .models import Booking, InvalidStatusTransition
@@ -269,10 +270,11 @@ def cancel_booking(*, booking: Booking, actor: User, reason: str = "") -> Decima
     committed state, and the transition is audit-logged. Concurrent cancellations
     therefore serialize: the loser sees an already-cancelled booking and fails.
 
-    Only the refund amount is computed here; moving the money is the payment
-    layer's job and is wired in once holds are captured on booking. Until then
-    the amount is advisory — for a still-pending (unpaid) booking it is what
-    *would* be owed, not money actually taken.
+    The cancellation and the payment settlement happen in one transaction, so the
+    booking can never end up cancelled with its hold left dangling: reconcile_booking_payment
+    releases a full-refund hold (or fails an unconfirmed one) under the same lock,
+    booking-first then payment. A late (partial-refund) student cancellation is the one
+    case whose money is deferred to the capture flow — see reconcile_booking_payment.
 
     Returns the refund amount owed to the student. Raises BookingNotCancellableError
     when the actor is not a party to the booking or the booking's current status
@@ -286,11 +288,14 @@ def cancel_booking(*, booking: Booking, actor: User, reason: str = "") -> Decima
         raise BookingNotCancellableError("only a party to the booking may cancel it")
 
     try:
-        booking.transition_to(target, actor=actor, reason=reason)
+        with transaction.atomic():
+            booking.transition_to(target, actor=actor, reason=reason)
+            refund = _refund_amount(booking, target, timezone.now())
+            reconcile_booking_payment(booking=booking, refund_amount=refund, actor=actor)
     except InvalidStatusTransition as exc:
         raise BookingNotCancellableError(str(exc)) from exc
 
-    return _refund_amount(booking, target, timezone.now())
+    return refund
 
 
 def expire_pending_bookings(*, now: dt.datetime | None = None) -> int:
@@ -306,6 +311,11 @@ def expire_pending_bookings(*, now: dt.datetime | None = None) -> int:
     between the scan and the sweep: confirmed→cancelled_by_student is itself a
     legal edge, so the status machine alone would happily cancel a just-paid
     lesson; the pending re-check under the lock is what prevents that.
+
+    A pending booking's only possible live payment is an unconfirmed ``created`` hold
+    (a confirmed hold would have moved the booking to confirmed), so reconciling it in
+    the same transaction fails that payment and frees any hold opened at the PSP. The
+    full ``booking.price`` is passed as the refund because nothing was captured.
 
     Returns the number of bookings cancelled.
     """
@@ -328,5 +338,6 @@ def expire_pending_bookings(*, now: dt.datetime | None = None) -> int:
                 actor=None,  # system action; no human actor
                 reason="pending payment timeout",
             )
+            reconcile_booking_payment(booking=booking, refund_amount=booking.price, actor=None)
             cancelled += 1
     return cancelled

@@ -96,11 +96,12 @@ def test_confirm_hold_rejects_a_non_pending_booking(booking_status):
 @pytest.mark.postgres
 @pytest.mark.django_db(transaction=True)
 def test_confirm_hold_and_timeout_sweep_never_both_apply():
-    # The B3 race: a hold confirms at the same instant the pending-timeout sweep
-    # runs. Both take the booking's row lock (confirm_hold locks booking-first,
-    # like the sweep), so whichever grabs it first wins and the loser is rejected.
-    # The booking must never end up both confirmed and cancelled, and a held
-    # payment must never sit on a cancelled booking.
+    # A hold confirms at the same instant the pending-timeout sweep runs. Both take
+    # the booking's row lock (confirm_hold locks booking-first, like the sweep), so
+    # whichever grabs it first wins and the loser is rejected. The booking must never
+    # end up both confirmed and cancelled, and the payment must end in a state coherent
+    # with the booking: held under a confirmed booking, failed under a swept one (the
+    # sweep now reconciles the unconfirmed hold, not just the booking).
     # PostgreSQL-only: SQLite ignores select_for_update, so no real lock forms.
     booking, payment = _pending_with_created_payment()
     Booking.objects.filter(pk=booking.pk).update(
@@ -136,6 +137,7 @@ def test_confirm_hold_and_timeout_sweep_never_both_apply():
         # Confirm won the lock: the hold is held and the sweep left it alone.
         assert payment.status == PS.HELD
     else:
-        # Sweep won the lock: the booking timed out and the hold stayed created.
+        # Sweep won the lock: the booking timed out and its unconfirmed hold was
+        # reconciled to failed in the same transaction.
         assert booking.status == BS.CANCELLED_BY_STUDENT
-        assert payment.status == PS.CREATED
+        assert payment.status == PS.FAILED

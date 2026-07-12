@@ -133,12 +133,21 @@ def request_hold(payment_id: int) -> None:
         booking_id=payment.booking_id,
         idempotency_key=f"hold-{payment.id}",
     )
-    # Compare-and-swap: store the id only while the row is still created with no id,
-    # so a concurrent or redelivered run cannot overwrite an already-stored
-    # provider_id and lose the hold it points at.
-    Payment.objects.filter(pk=payment.id, status=Payment.Status.CREATED, provider_id="").update(
+    # Compare-and-swap on an empty provider_id: store the id only while none is set,
+    # so a concurrent or redelivered run cannot overwrite an id already pointing at a
+    # live hold. Status is deliberately NOT part of the condition — an empty
+    # provider_id already excludes every non-created status (a hold id is always
+    # stored before any held/captured/refunded transition), so the only case the
+    # dropped status check newly rescues is a payment failed *mid-flight*: if the
+    # booking was cancelled while this call was opening the hold, we must still record
+    # the hold we opened so it can be released rather than orphaned.
+    updated = Payment.objects.filter(pk=payment.id, provider_id="").update(
         provider_id=result.provider_id, updated_at=timezone.now()
     )
+    if updated and Payment.objects.filter(pk=payment.id, status=Payment.Status.FAILED).exists():
+        # The hold we just opened backs a booking that was cancelled mid-flight; free
+        # it now instead of waiting for the PSP's confirmation webhook to notice.
+        _enqueue_release(payment.id)
 
 
 def confirm_hold(payment: Payment, *, actor: User | None = None) -> None:
@@ -182,6 +191,60 @@ def confirm_hold(payment: Payment, *, actor: User | None = None) -> None:
         booking.transition_to(Booking.Status.CONFIRMED, actor=actor, reason="payment held")
 
     payment.status = Payment.Status.HELD
+
+
+def reconcile_booking_payment(
+    *, booking: Booking, refund_amount: Decimal, actor: User | None
+) -> None:
+    """Settle a booking's live payment after the booking reached a terminal cancel state.
+
+    The single point that keeps the money consistent with a cancelled or timed-out
+    booking. Call it from within the caller's transaction, right after the booking's
+    terminal transition: the caller has already locked the booking row, and this locks
+    the payment, so the lock order stays booking → payment (matching confirm_hold and
+    the timeout sweep) and no deadlock forms.
+
+    What happens depends on the payment's state and the refund owed to the student:
+
+    * ``created`` — the hold was never confirmed on our side (the booking was still
+      pending), so the money is not ours: the payment is failed and any hold already
+      opened at the PSP is released. ``refund_amount`` is irrelevant here — nothing was
+      captured, so freeing the whole authorization is the only outcome.
+    * ``held`` with a full refund (``refund_amount >= amount``: a tutor cancellation, a
+      student cancelling more than 24h ahead, or a 100% late-cancel policy) — the hold
+      is released in full (held → refunded) and voided at the PSP.
+    * ``held`` with a partial refund (``refund_amount < amount``: a late student
+      cancellation) — the retained part must be captured and paid out to the tutor.
+      That needs the capture-and-credit machinery introduced with lesson completion, so
+      it is intentionally deferred: the hold is left in place until then rather than
+      released in full (which would hand the student a refund the policy does not owe).
+
+    Idempotent and safe on a booking with no payment: a redelivered call finds the
+    payment already terminal and does nothing.
+
+    Args:
+        booking: The booking whose payment to reconcile; already in a terminal status.
+        refund_amount: Money owed back to the student under the cancellation policy.
+        actor: User behind the change; None means the system (the timeout sweep).
+    """
+    live = Payment.objects.select_for_update().filter(
+        booking=booking, status__in=(Payment.Status.CREATED, Payment.Status.HELD)
+    )
+    # At most one live payment exists per booking (initiate_payment enforces it under
+    # the booking lock); iterating is just defensive against a stray second one.
+    for payment in live:
+        if payment.status == Payment.Status.CREATED:
+            payment.transition_to(
+                Payment.Status.FAILED, actor=actor, reason="booking cancelled before hold confirmed"
+            )
+            transaction.on_commit(lambda pid=payment.id: _enqueue_release(pid))
+        elif refund_amount >= payment.amount:
+            payment.transition_to(
+                Payment.Status.REFUNDED, actor=actor, reason="booking cancelled, hold released"
+            )
+            transaction.on_commit(lambda pid=payment.id: _enqueue_release(pid))
+        # else: a partial refund captures the retained part — deferred to the capture
+        # flow, so the hold is left untouched here.
 
 
 def handle_webhook_event(event: WebhookEvent) -> None:
@@ -274,19 +337,27 @@ def _on_hold_failed(payment: Payment) -> None:
         locked.transition_to(Payment.Status.FAILED, reason="authorization declined")
 
 
-def request_release(payment_id: int) -> None:
-    """Ask the provider to void an orphaned hold; idempotent and safe to retry.
+# A hold is voided at the PSP for a payment in either terminal "money goes back to
+# the student" state: ``failed`` (an orphaned or declined hold) or ``refunded`` (a
+# confirmed hold released in full when its booking was cancelled). Both free the
+# whole authorization; a partial capture keeps its remainder and is never released.
+_RELEASABLE_STATUSES = frozenset({Payment.Status.FAILED, Payment.Status.REFUNDED})
 
-    Called for a payment already marked ``failed`` whose hold nonetheless succeeded
-    at the PSP (a late success on a booking that is gone). Only a failed payment
-    that actually holds a provider authorization is released; the stable
-    idempotency_key lets a retried release de-duplicate PSP-side.
+
+def request_release(payment_id: int) -> None:
+    """Ask the provider to void a hold and free the money; idempotent and safe to retry.
+
+    Called for a payment whose whole authorization must go back to the student: a
+    ``failed`` hold (declined, or an orphan whose booking is gone) or a ``refunded``
+    one (a confirmed hold released when its booking was cancelled). Only a payment in
+    one of those states that actually holds a provider authorization is released; the
+    stable idempotency_key lets a retried release de-duplicate PSP-side.
 
     Raises:
         PaymentProviderError: On a provider-side failure, so the task retries.
     """
     payment = Payment.objects.get(pk=payment_id)
-    if payment.status != Payment.Status.FAILED or not payment.provider_id:
+    if payment.status not in _RELEASABLE_STATUSES or not payment.provider_id:
         return
     provider = get_payment_provider()
     provider.release(provider_id=payment.provider_id, idempotency_key=f"release-{payment.id}")
