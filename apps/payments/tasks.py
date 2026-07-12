@@ -2,8 +2,6 @@
 # Licensed under PolyForm Noncommercial License 1.0.0 (see LICENSE).
 """Celery tasks for the payment domain."""
 
-from decimal import Decimal
-
 from celery import shared_task
 
 from . import services
@@ -56,15 +54,16 @@ def capture_payment(payment_id: int) -> None:
     retry_jitter=True,
     max_retries=5,
 )
-def capture_partial_payment(payment_id: int, retained_amount: str) -> None:
+def capture_partial_payment(payment_id: int) -> None:
     """Capture the retained part of a late-cancelled booking's hold and credit the tutor.
 
-    Thin wrapper over services.request_partial_capture. The retained amount arrives as a
-    string (money keeps its Decimal precision across the JSON broker); the capture is
-    authoritative for the money, so the domain flip to ``captured`` and the balance credit
-    happen only after it returns, and a provider-side failure is retried with backoff.
+    Thin wrapper over services.request_partial_capture. The retained amount is read from the
+    payment's committed state (persisted when the booking was cancelled), so it survives a
+    lost or redelivered broker message. The capture is authoritative for the money, so the
+    domain flip to ``captured`` and the balance credit happen only after it returns, and a
+    provider-side failure is retried with backoff.
     """
-    services.request_partial_capture(payment_id, Decimal(retained_amount))
+    services.request_partial_capture(payment_id)
 
 
 @shared_task(

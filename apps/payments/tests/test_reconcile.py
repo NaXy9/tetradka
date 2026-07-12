@@ -52,8 +52,15 @@ class _RecordingProvider:
         return CaptureResult(provider_id=provider_id, captured_amount=Decimal(amount))
 
 
-def _confirmed_with_held_payment(*, price="1500.00", refund_percent=0, hours_ahead=48):
-    """A confirmed booking backed by a held payment, party-scoped and priced."""
+def _confirmed_with_held_payment(
+    *, price="1500.00", refund_percent=0, hours_ahead=48, retained="0"
+):
+    """A confirmed booking backed by a held payment, party-scoped and priced.
+
+    ``retained`` pins the late-cancellation penalty on the payment, mirroring what reconcile
+    persists when a booking is cancelled: tests that call request_partial_capture directly
+    set it, while end-to-end cancel tests leave it 0 and assert reconcile persists it.
+    """
     tutor = TutorProfileFactory(late_cancellation_refund_percent=refund_percent)
     student = UserFactory()
     starts_at = timezone.now() + dt.timedelta(hours=hours_ahead)
@@ -71,6 +78,7 @@ def _confirmed_with_held_payment(*, price="1500.00", refund_percent=0, hours_ahe
         provider_id="mock-hold-1",
         amount=booking.price,
         status=PS.HELD,
+        retained_amount=Decimal(retained),
     )
     return booking, payment
 
@@ -104,9 +112,10 @@ def test_student_cancel_over_24h_releases_the_held_payment(
     booking.refresh_from_db()
     assert refund == Decimal("1500.00")
     assert booking.status == BS.CANCELLED_BY_STUDENT
-    # Full refund: the hold is released, not captured — no money settles.
+    # Full refund: the hold is released, not captured — no money settles and no penalty is pinned.
     assert payment.status == PS.REFUNDED
     assert payment.captured_amount == Decimal("0")
+    assert payment.retained_amount == Decimal("0")
     assert provider.released == [("mock-hold-1", f"release-{payment.id}")]
 
 
@@ -124,6 +133,7 @@ def test_tutor_cancel_releases_the_held_payment(monkeypatch, django_capture_on_c
     assert refund == Decimal("1500.00")
     assert booking.status == BS.CANCELLED_BY_TUTOR
     assert payment.status == PS.REFUNDED
+    assert payment.retained_amount == Decimal("0")
     assert provider.released == [("mock-hold-1", f"release-{payment.id}")]
 
 
@@ -142,6 +152,7 @@ def test_late_cancel_with_full_policy_releases_the_held_payment(
     payment.refresh_from_db()
     assert refund == Decimal("1500.00")
     assert payment.status == PS.REFUNDED
+    assert payment.retained_amount == Decimal("0")
     assert provider.released == [("mock-hold-1", f"release-{payment.id}")]
 
 
@@ -167,7 +178,9 @@ def test_late_partial_cancel_captures_retained_part_and_credits_tutor(
     booking.refresh_from_db()
     assert refund == Decimal("750.00")  # half refunded to the student
     assert booking.status == BS.CANCELLED_BY_STUDENT
-    # The other half is captured and paid out after commission (10% of 750).
+    # The retained penalty is pinned in committed state, then captured and paid out after
+    # commission (10% of 750).
+    assert payment.retained_amount == Decimal("750.00")
     assert payment.status == PS.CAPTURED
     assert payment.captured_amount == Decimal("750.00")
     assert payment.commission == Decimal("75.00")
@@ -193,23 +206,47 @@ def test_late_partial_cancel_with_zero_refund_captures_the_full_hold(
 
     payment.refresh_from_db()
     assert refund == Decimal("0.00")
+    assert payment.retained_amount == Decimal("1500.00")  # the whole hold is retained
     assert payment.status == PS.CAPTURED
     assert payment.captured_amount == Decimal("1500.00")
     assert provider.captured == [("mock-hold-1", Decimal("1500.00"), f"capture-{payment.id}")]
     assert provider.released == []
 
 
-def test_request_partial_capture_is_idempotent(monkeypatch):
-    # A retry after the retained part already settled must not capture or credit twice.
+def test_late_partial_cancel_persists_retained_even_if_the_capture_never_runs(monkeypatch):
+    # Durability: the retained penalty is written to committed state when the booking is
+    # cancelled, not only carried in the enqueued capture message. Here the on_commit
+    # callbacks are never executed (no django_capture_on_commit_callbacks), standing in for a
+    # broker that drops the message — the hold stays held, but the penalty survives on the
+    # payment and the capture stays recoverable, since amount holds the full price and the
+    # policy is never recomputed.
     booking, payment = _confirmed_with_held_payment(
         hours_ahead=1, price="1500.00", refund_percent=50
+    )
+    provider = _RecordingProvider()
+    monkeypatch.setattr(services, "get_payment_provider", lambda: provider)
+
+    refund = cancel_booking(booking=booking, actor=booking.student)
+
+    payment.refresh_from_db()
+    assert refund == Decimal("750.00")
+    assert payment.status == PS.HELD  # the async capture never ran
+    assert payment.retained_amount == Decimal("750.00")  # ...but the penalty is durable
+    assert provider.captured == []
+
+
+def test_request_partial_capture_is_idempotent(monkeypatch):
+    # A retry after the retained part already settled must not capture or credit twice. The
+    # retained amount is read from the payment (persisted by reconcile), not passed in.
+    booking, payment = _confirmed_with_held_payment(
+        hours_ahead=1, price="1500.00", refund_percent=50, retained="750.00"
     )
     Booking.objects.filter(pk=booking.pk).update(status=BS.CANCELLED_BY_STUDENT)
     provider = _RecordingProvider()
     monkeypatch.setattr(services, "get_payment_provider", lambda: provider)
 
-    services.request_partial_capture(payment.id, Decimal("750.00"))
-    services.request_partial_capture(payment.id, Decimal("750.00"))
+    services.request_partial_capture(payment.id)
+    services.request_partial_capture(payment.id)
 
     payment.refresh_from_db()
     assert payment.status == PS.CAPTURED
@@ -222,11 +259,13 @@ def test_request_partial_capture_is_idempotent(monkeypatch):
 def test_request_partial_capture_skips_a_booking_not_cancelled_by_student(monkeypatch):
     # A held payment whose booking is still confirmed (a stray enqueue) is left alone —
     # only a student-cancelled booking's hold is partially captured.
-    booking, payment = _confirmed_with_held_payment(hours_ahead=1, refund_percent=50)
+    booking, payment = _confirmed_with_held_payment(
+        hours_ahead=1, refund_percent=50, retained="750.00"
+    )
     provider = _RecordingProvider()
     monkeypatch.setattr(services, "get_payment_provider", lambda: provider)
 
-    services.request_partial_capture(payment.id, Decimal("750.00"))
+    services.request_partial_capture(payment.id)
 
     payment.refresh_from_db()
     assert payment.status == PS.HELD
@@ -236,15 +275,34 @@ def test_request_partial_capture_skips_a_booking_not_cancelled_by_student(monkey
 def test_request_partial_capture_without_a_hold_id_is_a_noop(monkeypatch):
     # No provider id means the hold was never opened at the PSP; there is nothing to
     # capture even though the booking was cancelled.
-    booking, payment = _confirmed_with_held_payment(hours_ahead=1, refund_percent=50)
+    booking, payment = _confirmed_with_held_payment(
+        hours_ahead=1, refund_percent=50, retained="750.00"
+    )
     Payment.objects.filter(pk=payment.pk).update(provider_id="")
     Booking.objects.filter(pk=booking.pk).update(status=BS.CANCELLED_BY_STUDENT)
     provider = _RecordingProvider()
     monkeypatch.setattr(services, "get_payment_provider", lambda: provider)
 
-    services.request_partial_capture(payment.id, Decimal("750.00"))
+    services.request_partial_capture(payment.id)
 
     payment.refresh_from_db()
+    assert payment.status == PS.HELD
+    assert provider.captured == []
+
+
+def test_request_partial_capture_without_a_pinned_retained_is_a_noop(monkeypatch):
+    # The penalty was never pinned (retained_amount still 0): a stray enqueue that ran ahead
+    # of the reconcile which sets it must leave the hold held and recoverable, never settle a
+    # zero capture into a terminal captured state.
+    booking, payment = _confirmed_with_held_payment(hours_ahead=1, refund_percent=50)
+    Booking.objects.filter(pk=booking.pk).update(status=BS.CANCELLED_BY_STUDENT)
+    provider = _RecordingProvider()
+    monkeypatch.setattr(services, "get_payment_provider", lambda: provider)
+
+    services.request_partial_capture(payment.id)
+
+    payment.refresh_from_db()
+    assert payment.retained_amount == Decimal("0")
     assert payment.status == PS.HELD
     assert provider.captured == []
 
@@ -252,7 +310,9 @@ def test_request_partial_capture_without_a_hold_id_is_a_noop(monkeypatch):
 def test_partial_capture_provider_failure_leaves_the_hold_untouched(monkeypatch):
     # A provider failure propagates so the Celery task retries; the hold stays held and
     # nothing is captured or credited until it settles.
-    booking, payment = _confirmed_with_held_payment(hours_ahead=1, refund_percent=50)
+    booking, payment = _confirmed_with_held_payment(
+        hours_ahead=1, refund_percent=50, retained="750.00"
+    )
     Booking.objects.filter(pk=booking.pk).update(status=BS.CANCELLED_BY_STUDENT)
 
     class _FailingProvider:
@@ -262,7 +322,7 @@ def test_partial_capture_provider_failure_leaves_the_hold_untouched(monkeypatch)
     monkeypatch.setattr(services, "get_payment_provider", lambda: _FailingProvider())
 
     with pytest.raises(PaymentProviderError):
-        services.request_partial_capture(payment.id, Decimal("750.00"))
+        services.request_partial_capture(payment.id)
 
     payment.refresh_from_db()
     assert payment.status == PS.HELD
@@ -271,16 +331,18 @@ def test_partial_capture_provider_failure_leaves_the_hold_untouched(monkeypatch)
     assert tutor.balance == Decimal("0")
 
 
-def test_capture_partial_payment_task_converts_amount_and_delegates(monkeypatch):
-    # The task boundary: the retained amount crosses the broker as a string and must be
-    # rebuilt as a Decimal before the service captures it (CELERY_TASK_ALWAYS_EAGER runs
-    # the task inline; .get() returns its result).
-    booking, payment = _confirmed_with_held_payment(hours_ahead=1, refund_percent=50)
+def test_capture_partial_payment_task_reads_retained_and_delegates(monkeypatch):
+    # The task boundary: it carries only the payment id now — the retained amount is read
+    # from the payment's committed state, so a lost or redelivered message cannot corrupt it
+    # (CELERY_TASK_ALWAYS_EAGER runs the task inline; .get() returns its result).
+    booking, payment = _confirmed_with_held_payment(
+        hours_ahead=1, refund_percent=50, retained="750.00"
+    )
     Booking.objects.filter(pk=booking.pk).update(status=BS.CANCELLED_BY_STUDENT)
     provider = _RecordingProvider()
     monkeypatch.setattr(services, "get_payment_provider", lambda: provider)
 
-    tasks.capture_partial_payment.delay(payment.id, "750.00").get()
+    tasks.capture_partial_payment.delay(payment.id).get()
 
     payment.refresh_from_db()
     assert payment.status == PS.CAPTURED

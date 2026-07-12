@@ -148,6 +148,14 @@ def test_commission_cannot_exceed_captured_amount():
         payment.save(update_fields=["captured_amount", "commission"])
 
 
+def test_retained_amount_cannot_exceed_amount():
+    # The late-cancellation penalty pinned for capture can never exceed the held amount.
+    payment = _payment(amount=Decimal("1500"))
+    payment.retained_amount = Decimal("2000")
+    with pytest.raises(IntegrityError), transaction.atomic():
+        payment.save(update_fields=["retained_amount"])
+
+
 @pytest.mark.postgres
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_transitions_take_exactly_one_edge():

@@ -61,6 +61,16 @@ class Payment(TimeStampedModel):
     captured_amount = models.DecimalField(
         max_digits=10, decimal_places=2, default=0, validators=[MinValueValidator(0)]
     )
+    # The penalty to capture for the tutor on a late student cancellation, pinned from
+    # the cancellation policy and written when the booking is cancelled — the capture
+    # *intent*, distinct from captured_amount (the settled result). Persisting it (vs.
+    # carrying it only in the enqueued capture message) makes it recoverable if the
+    # message is lost: amount holds the full price and the policy is never recomputed
+    # in the payments layer, so committed state is the only place it survives. 0 on
+    # every other path (full capture, full release, still held).
+    retained_amount = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0, validators=[MinValueValidator(0)]
+    )
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.CREATED)
 
     class Meta:
@@ -73,8 +83,9 @@ class Payment(TimeStampedModel):
                 condition=~models.Q(provider_id=""),
                 name="uniq_payment_provider_id",
             ),
-            # Money guards: can never capture more than was held, and the platform
-            # commission can never exceed what was actually captured.
+            # Money guards: can never capture more than was held, the platform
+            # commission can never exceed what was actually captured, and the retained
+            # penalty can never exceed the held amount.
             models.CheckConstraint(
                 condition=models.Q(captured_amount__lte=models.F("amount")),
                 name="payment_captured_le_amount",
@@ -82,6 +93,10 @@ class Payment(TimeStampedModel):
             models.CheckConstraint(
                 condition=models.Q(commission__lte=models.F("captured_amount")),
                 name="payment_commission_le_captured",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(retained_amount__lte=models.F("amount")),
+                name="payment_retained_le_amount",
             ),
         ]
 
