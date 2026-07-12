@@ -222,10 +222,12 @@ def reconcile_booking_payment(
       student cancelling more than 24h ahead, or a 100% late-cancel policy) — the hold
       is released in full (held → refunded) and voided at the PSP.
     * ``held`` with a partial refund (``refund_amount < amount``: a late student
-      cancellation) — the retained part must be captured and paid out to the tutor.
-      That needs the capture-and-credit machinery introduced with lesson completion, so
-      it is intentionally deferred: the hold is left in place until then rather than
-      released in full (which would hand the student a refund the policy does not owe).
+      cancellation under a policy that keeps part of the price) — the retained part
+      (``amount − refund_amount``) is captured and paid out to the tutor, while the
+      provider releases the rest back to the student in the same partial capture. The
+      provider call runs after commit like every other one, so the retained amount is
+      pinned here from the refund the policy decided: it is not stored in committed state,
+      and the payments layer must not re-derive the booking's cancellation policy.
 
     Idempotent and safe on a booking with no payment: a redelivered call finds the
     payment already terminal and does nothing.
@@ -251,8 +253,19 @@ def reconcile_booking_payment(
                 Payment.Status.REFUNDED, actor=actor, reason="booking cancelled, hold released"
             )
             transaction.on_commit(lambda pid=payment.id: _enqueue_release(pid))
-        # else: a partial refund captures the retained part — deferred to the capture
-        # flow, so the hold is left untouched here.
+        else:
+            # A partial refund: capture the retained part for the tutor; the provider
+            # releases the rest to the student in the same call. The retained amount is
+            # pinned from the policy's refund here (see the docstring) and carried to the
+            # after-commit provider call, which stays held until it settles.
+            # FIXME(igor): the retained amount is carried only in the Celery message, never
+            # persisted. If the broker drops it the hold is stranded in ``held`` with no way
+            # to recover the penalty — amount holds the full price, and the policy must not be
+            # recomputed here. Persist it with the cancellation before enqueuing.
+            retained = payment.amount - refund_amount
+            transaction.on_commit(
+                lambda pid=payment.id, amt=retained: _enqueue_partial_capture(pid, amt)
+            )
 
 
 def capture_booking_payment(*, booking: Booking) -> None:
@@ -349,11 +362,49 @@ def request_capture(payment_id: int) -> None:
     capture_and_credit(payment=payment, captured_amount=result.captured_amount, actor=None)
 
 
+def request_partial_capture(payment_id: int, retained_amount: Decimal) -> None:
+    """Capture the retained part of a late-cancelled booking's hold; idempotent, safe to retry.
+
+    The late-cancellation counterpart to request_capture. A student who cancels inside the
+    refund window forfeits part of the price under the tutor's policy: that ``retained_amount``
+    is captured and paid out, and the provider releases the remainder to the student in the
+    same partial capture — no separate release is needed. Only a still-``held`` payment whose
+    booking the student cancelled is captured, so a retry after the money settled — or a stray
+    enqueue — is a no-op. A payment shares the same ``capture-{id}`` idempotency_key as a full
+    capture: a booking is either completed or cancelled, never both, so a payment is captured
+    at most once and the keys never collide.
+
+    Raises:
+        PaymentProviderError: On a provider-side failure, so the task retries with backoff;
+            the hold stays held and nothing is credited until it settles.
+    """
+    payment = Payment.objects.select_related("booking").get(pk=payment_id)
+    if payment.status != Payment.Status.HELD or not payment.provider_id:
+        return
+    if payment.booking.status != Booking.Status.CANCELLED_BY_STUDENT:
+        return  # partial capture only settles a late student cancellation's hold
+    provider = get_payment_provider()
+    result = provider.capture(
+        provider_id=payment.provider_id,
+        amount=retained_amount,
+        idempotency_key=f"capture-{payment.id}",
+    )
+    capture_and_credit(payment=payment, captured_amount=result.captured_amount, actor=None)
+
+
 def _enqueue_capture(payment_id: int) -> None:
     # Imported lazily: tasks import this module, so a top-level import would cycle.
     from .tasks import capture_payment
 
     capture_payment.delay(payment_id)
+
+
+def _enqueue_partial_capture(payment_id: int, retained_amount: Decimal) -> None:
+    # Imported lazily: tasks import this module, so a top-level import would cycle.
+    from .tasks import capture_partial_payment
+
+    # Money crosses the broker as a string to keep Decimal precision under a JSON serializer.
+    capture_partial_payment.delay(payment_id, str(retained_amount))
 
 
 def handle_webhook_event(event: WebhookEvent) -> None:

@@ -278,8 +278,8 @@ def cancel_booking(*, booking: Booking, actor: User, reason: str = "") -> Decima
     The cancellation and the payment settlement happen in one transaction, so the
     booking can never end up cancelled with its hold left dangling: reconcile_booking_payment
     releases a full-refund hold (or fails an unconfirmed one) under the same lock,
-    booking-first then payment. A late (partial-refund) student cancellation is the one
-    case whose money is deferred to the capture flow — see reconcile_booking_payment.
+    booking-first then payment. A late (partial-refund) student cancellation captures the
+    retained part for the tutor and releases the rest — see reconcile_booking_payment.
 
     Returns the refund amount owed to the student. Raises BookingNotCancellableError
     when the actor is not a party to the booking or the booking's current status
