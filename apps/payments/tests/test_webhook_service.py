@@ -154,6 +154,26 @@ def test_late_hold_succeeded_on_a_held_orphan_releases_the_hold(
     assert provider.released == [("mock-hold-1", f"release-{payment.id}")]
 
 
+def test_late_hold_succeeded_on_a_completed_booking_keeps_the_hold_for_capture(
+    monkeypatch, django_capture_on_commit_callbacks
+):
+    # The money-critical regression: a lesson auto-completed and its hold is still
+    # held, awaiting the async capture, when a late/duplicate hold_succeeded arrives.
+    # The hold must stay held (owed to capture) — never failed and released, which
+    # would refund the student a delivered lesson and leave the tutor unpaid.
+    booking, payment = _payment(booking_status=BS.COMPLETED, payment_status=PS.HELD)
+    provider = _RecordingProvider()
+    monkeypatch.setattr(services, "get_payment_provider", lambda: provider)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        services.handle_webhook_event(_event(WebhookType.HOLD_SUCCEEDED, event_id="evt-late"))
+
+    payment.refresh_from_db()
+    assert payment.status == PS.HELD
+    assert not payment.transitions.exists()
+    assert provider.released == []  # the hold is not voided
+
+
 def test_release_task_delegates_to_the_service(monkeypatch):
     _, payment = _payment(payment_status=PS.FAILED)
     provider = _RecordingProvider()

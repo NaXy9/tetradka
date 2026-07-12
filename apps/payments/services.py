@@ -9,6 +9,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.bookings.models import Booking
+from apps.catalog.models import TutorProfile
 from apps.users.models import User
 
 from .models import InvalidStatusTransition, Payment, ProcessedWebhookEvent
@@ -160,16 +161,19 @@ def confirm_hold(payment: Payment, *, actor: User | None = None) -> None:
     same instant the sweep runs serializes cleanly and whichever grabs the booking
     row first wins.
 
-    Idempotent: a redelivered confirmation (payment already held, booking already
-    confirmed) is a no-op.
+    Idempotent: a redelivered or late confirmation is a no-op when the hold is already
+    held and its booking has moved forward — confirmed, or completed and awaiting the
+    async capture (whose hold must never be released as an orphan).
 
     Args:
         payment: The payment whose hold the provider confirmed.
         actor: User behind the change; None means the system (a webhook).
 
     Raises:
-        HoldNotConfirmable: If the booking is no longer pending (it timed out or
-            was cancelled first); the caller must release the orphaned hold.
+        HoldNotConfirmable: If the booking was cancelled or timed out before the hold
+            confirmed; the caller must release the orphaned hold. A booking that has
+            already moved forward (confirmed, or completed and awaiting capture) is a
+            no-op instead — its held hold is never treated as an orphan.
         InvalidStatusTransition: If the payment cannot move to ``held`` (already
             terminal, e.g. a prior failure).
     """
@@ -177,10 +181,14 @@ def confirm_hold(payment: Payment, *, actor: User | None = None) -> None:
         booking = Booking.objects.select_for_update().get(pk=payment.booking_id)
         locked_payment = Payment.objects.select_for_update().get(pk=payment.pk)
 
-        if (
-            locked_payment.status == Payment.Status.HELD
-            and booking.status == Booking.Status.CONFIRMED
+        if locked_payment.status == Payment.Status.HELD and booking.status in (
+            Booking.Status.CONFIRMED,
+            Booking.Status.COMPLETED,
         ):
+            # Already applied (confirmed), or the lesson is already delivered and the
+            # hold is owed to the capture flow (completed). A redelivered or late
+            # success is a no-op — critically, a completed booking's held hold must
+            # never be torn down and released, or the tutor loses a captured lesson.
             payment.status = Payment.Status.HELD  # keep the passed instance in sync
             return
 
@@ -245,6 +253,107 @@ def reconcile_booking_payment(
             transaction.on_commit(lambda pid=payment.id: _enqueue_release(pid))
         # else: a partial refund captures the retained part — deferred to the capture
         # flow, so the hold is left untouched here.
+
+
+def capture_booking_payment(*, booking: Booking) -> None:
+    """Enqueue capture of a completed booking's held hold; call within the booking txn.
+
+    The completion sweep moves a booking to ``completed`` under its row lock and then
+    calls this: the held hold is the capture intent and is left in place, while the
+    actual provider capture is fired asynchronously after commit (like every other
+    provider call), so a slow PSP never blocks the sweep. The async task re-derives
+    the amount from committed state and settles it.
+
+    A booking with no held payment (an unpaid edge) is a clean no-op.
+
+    Args:
+        booking: The just-completed booking whose hold to capture.
+    """
+    payment = (
+        Payment.objects.select_for_update()
+        .filter(booking=booking, status=Payment.Status.HELD)
+        .first()
+    )
+    if payment is None:
+        return
+    transaction.on_commit(lambda pid=payment.id: _enqueue_capture(pid))
+
+
+def capture_and_credit(*, payment: Payment, captured_amount: Decimal, actor: User | None) -> None:
+    """Capture money from a confirmed hold and credit the tutor's balance, atomically.
+
+    The shared settle-and-credit primitive behind lesson completion (a full capture)
+    and, later, a late partial cancellation (capturing the retained part). The status
+    flip and the balance credit run in ONE transaction, so the tutor is never credited
+    without the payment marked captured, nor the reverse.
+
+    Only ever called after ``provider.capture`` has authoritatively confirmed the money
+    was taken — its return is the source of truth for a capture — so the balance is
+    credited against a real settlement, never optimistically ahead of it.
+
+    Idempotent: a redelivered capture (payment already ``captured``) is a no-op, so the
+    tutor is credited exactly once even if the task retries after the commit.
+
+    Args:
+        payment: The held payment to capture.
+        captured_amount: Money actually taken from the hold (the provider's figure).
+        actor: User behind the change; None means the system (the capture task).
+    """
+    commission, payout = calc_commission(captured_amount)
+    with transaction.atomic():
+        locked = Payment.objects.select_for_update().get(pk=payment.pk)
+        if locked.status == Payment.Status.CAPTURED:
+            return  # already captured — must not credit the tutor a second time
+        locked.transition_to(
+            Payment.Status.CAPTURED,
+            actor=actor,
+            reason="hold captured",
+            captured_amount=captured_amount,
+            commission=commission,
+        )
+        # Lock the profile row so lessons completing concurrently for the same tutor
+        # cannot lose a balance update; the once-per-payment guarantee is the status
+        # guard above — this lock only serializes the arithmetic.
+        tutor = TutorProfile.objects.select_for_update().get(pk=locked.booking.tutor_id)
+        tutor.balance += payout
+        tutor.save(update_fields=["balance", "updated_at"])
+    payment.status = Payment.Status.CAPTURED
+    payment.captured_amount = captured_amount
+    payment.commission = commission
+
+
+def request_capture(payment_id: int) -> None:
+    """Capture a completed lesson's hold and credit the tutor; idempotent, safe to retry.
+
+    Asks the provider to take the full held amount, then records the capture and credits
+    the tutor via capture_and_credit. Only a still-``held`` payment backing a
+    ``completed`` booking is captured, so a retry after the money already settled — or a
+    stray enqueue for a booking that never completed — is a no-op. The stable
+    idempotency_key lets a retried capture de-duplicate PSP-side.
+
+    Raises:
+        PaymentProviderError: On a provider-side failure, so the task retries with
+            backoff; the hold stays held and nothing is credited until it settles.
+    """
+    payment = Payment.objects.select_related("booking").get(pk=payment_id)
+    if payment.status != Payment.Status.HELD or not payment.provider_id:
+        return
+    if payment.booking.status != Booking.Status.COMPLETED:
+        return  # capture only settles a delivered (completed) lesson's hold
+    provider = get_payment_provider()
+    result = provider.capture(
+        provider_id=payment.provider_id,
+        amount=payment.amount,
+        idempotency_key=f"capture-{payment.id}",
+    )
+    capture_and_credit(payment=payment, captured_amount=result.captured_amount, actor=None)
+
+
+def _enqueue_capture(payment_id: int) -> None:
+    # Imported lazily: tasks import this module, so a top-level import would cycle.
+    from .tasks import capture_payment
+
+    capture_payment.delay(payment_id)
 
 
 def handle_webhook_event(event: WebhookEvent) -> None:

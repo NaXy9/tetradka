@@ -15,7 +15,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.catalog.models import Subject, TutorProfile
-from apps.payments.services import reconcile_booking_payment
+from apps.payments.services import capture_booking_payment, reconcile_booking_payment
 from apps.users.models import User
 
 from .models import Booking, InvalidStatusTransition
@@ -33,6 +33,11 @@ CANCELLATION_FULL_REFUND_WINDOW = dt.timedelta(hours=24)
 # A booking holds its slot only briefly while awaiting payment; left unpaid past
 # this window it is auto-cancelled so the slot returns to the pool.
 PENDING_PAYMENT_TIMEOUT = dt.timedelta(minutes=15)
+
+# Once a confirmed lesson's end plus this grace has passed it is auto-completed and
+# its hold captured. The grace covers a lesson running over its scheduled end (the
+# video window stays open past ends_at), so completion never settles a live session.
+COMPLETION_GRACE = dt.timedelta(minutes=15)
 
 
 class SlotUnavailableError(Exception):
@@ -341,3 +346,46 @@ def expire_pending_bookings(*, now: dt.datetime | None = None) -> int:
             reconcile_booking_payment(booking=booking, refund_amount=booking.price, actor=None)
             cancelled += 1
     return cancelled
+
+
+def complete_confirmed_bookings(*, now: dt.datetime | None = None) -> int:
+    """Auto-complete confirmed lessons past their end (plus grace) and capture their holds.
+
+    A booking still ``confirmed`` once its ``ends_at`` plus COMPLETION_GRACE has elapsed
+    is treated as delivered: it moves to ``completed`` (the confirmed→completed edge) and
+    its held payment is captured, crediting the tutor after commission. Run periodically
+    by Celery beat.
+
+    Each candidate is re-checked as still ``confirmed`` under a row lock before the
+    transition, so a cancellation or no-show recorded first wins: the sweep never
+    overrides a booking that has already left ``confirmed``.
+
+    The capture is enqueued in the same transaction as the completion (fired after
+    commit), so a completed booking always ends up with its hold captured — the
+    ``completed ⇒ captured`` invariant.
+
+    Returns the number of bookings completed.
+    """
+    now = now or timezone.now()
+    cutoff = now - COMPLETION_GRACE
+    # Strict ``<``: a lesson exactly at its grace deadline has not yet elapsed it.
+    due_ids = list(
+        Booking.objects.filter(status=Booking.Status.CONFIRMED, ends_at__lt=cutoff).values_list(
+            "pk", flat=True
+        )
+    )
+
+    completed = 0
+    for pk in due_ids:
+        with transaction.atomic():
+            booking = Booking.objects.select_for_update().get(pk=pk)
+            if booking.status != Booking.Status.CONFIRMED:
+                continue  # cancelled or marked no-show concurrently; leave it alone
+            booking.transition_to(
+                Booking.Status.COMPLETED,
+                actor=None,  # system action; no human actor
+                reason="lesson auto-completed",
+            )
+            capture_booking_payment(booking=booking)
+            completed += 1
+    return completed

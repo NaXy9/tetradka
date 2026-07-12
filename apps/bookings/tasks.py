@@ -15,3 +15,13 @@ def expire_pending_bookings() -> int:
     broker-free and unit-testable. Returns the number of bookings cancelled.
     """
     return services.expire_pending_bookings()
+
+
+@shared_task(name="bookings.complete_confirmed_bookings")
+def complete_confirmed_bookings() -> int:
+    """Auto-complete finished confirmed lessons and capture their holds (Celery beat entry).
+
+    Thin wrapper over services.complete_confirmed_bookings so the domain logic stays
+    broker-free and unit-testable. Returns the number of bookings completed.
+    """
+    return services.complete_confirmed_bookings()

@@ -77,6 +77,23 @@ def test_confirm_hold_is_idempotent_on_redelivery():
     assert booking.transitions.count() == 1
 
 
+def test_confirm_hold_is_a_noop_for_a_completed_booking():
+    # After a lesson auto-completes its hold is still held, awaiting the async capture.
+    # A late or duplicate hold_succeeded landing in that window must leave the hold
+    # alone: it is owed to the capture flow, never released as an orphan (which would
+    # refund the student a delivered lesson and never pay the tutor).
+    booking, payment = _pending_with_created_payment()
+    Booking.objects.filter(pk=booking.pk).update(status=BS.COMPLETED)
+    Payment.objects.filter(pk=payment.pk).update(status=PS.HELD)
+    payment.refresh_from_db()
+
+    confirm_hold(payment)  # must not raise
+
+    payment.refresh_from_db()
+    assert payment.status == PS.HELD  # untouched, ready for capture
+    assert not payment.transitions.exists()
+
+
 @pytest.mark.parametrize("booking_status", [BS.CANCELLED_BY_STUDENT, BS.CONFIRMED])
 def test_confirm_hold_rejects_a_non_pending_booking(booking_status):
     # A hold that confirms after the booking already left pending (timed out, or

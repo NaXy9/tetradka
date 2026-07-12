@@ -165,6 +165,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "bookings.expire_pending_bookings",
         "schedule": 60.0,
     },
+    # Completion is not time-critical — the grace already absorbs a lesson running
+    # over — so it sweeps less often than the pending-payment timeout.
+    "complete-confirmed-bookings": {
+        "task": "bookings.complete_confirmed_bookings",
+        "schedule": 300.0,
+    },
 }
 
 # --- Payments -----------------------------------------------------------------
