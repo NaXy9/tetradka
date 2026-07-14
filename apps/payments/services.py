@@ -151,6 +151,26 @@ def request_hold(payment_id: int) -> None:
         _enqueue_release(payment.id)
 
 
+def _hold_is_still_owed(booking: Booking, payment: Payment) -> bool:
+    """Whether a held hold still backs something and must not be released as an orphan.
+
+    A hold is owed while its booking is heading for a capture: ``confirmed`` (the lesson
+    is upcoming), ``completed`` (delivered, awaiting the async full capture), or
+    ``cancelled_by_student`` carrying a pinned ``retained_amount`` (a late cancellation,
+    awaiting the async partial capture of the penalty). In every other terminal state
+    nothing is owed and the hold is a genuine orphan to be freed.
+
+    Args:
+        booking: The hold's booking, already re-read under its row lock.
+        payment: The held payment, already re-read under its row lock.
+    """
+    if booking.status in (Booking.Status.CONFIRMED, Booking.Status.COMPLETED):
+        return True
+    # The penalty is pinned when the booking is cancelled and captured after commit, so
+    # between those two the hold looks abandoned while it is in fact the capture intent.
+    return booking.status == Booking.Status.CANCELLED_BY_STUDENT and payment.retained_amount > 0
+
+
 def confirm_hold(payment: Payment, *, actor: User | None = None) -> None:
     """Apply a confirmed hold: Payment ``created→held`` and its booking ``pending→confirmed``.
 
@@ -162,8 +182,8 @@ def confirm_hold(payment: Payment, *, actor: User | None = None) -> None:
     row first wins.
 
     Idempotent: a redelivered or late confirmation is a no-op when the hold is already
-    held and its booking has moved forward — confirmed, or completed and awaiting the
-    async capture (whose hold must never be released as an orphan).
+    held and still owed to a pending capture (see _hold_is_still_owed) — such a hold must
+    never be released as an orphan.
 
     Args:
         payment: The payment whose hold the provider confirmed.
@@ -171,9 +191,8 @@ def confirm_hold(payment: Payment, *, actor: User | None = None) -> None:
 
     Raises:
         HoldNotConfirmable: If the booking was cancelled or timed out before the hold
-            confirmed; the caller must release the orphaned hold. A booking that has
-            already moved forward (confirmed, or completed and awaiting capture) is a
-            no-op instead — its held hold is never treated as an orphan.
+            confirmed; the caller must release the orphaned hold. A held hold that is
+            still owed to a pending capture is a no-op instead — see _hold_is_still_owed.
         InvalidStatusTransition: If the payment cannot move to ``held`` (already
             terminal, e.g. a prior failure).
     """
@@ -181,14 +200,12 @@ def confirm_hold(payment: Payment, *, actor: User | None = None) -> None:
         booking = Booking.objects.select_for_update().get(pk=payment.booking_id)
         locked_payment = Payment.objects.select_for_update().get(pk=payment.pk)
 
-        if locked_payment.status == Payment.Status.HELD and booking.status in (
-            Booking.Status.CONFIRMED,
-            Booking.Status.COMPLETED,
+        if locked_payment.status == Payment.Status.HELD and _hold_is_still_owed(
+            booking, locked_payment
         ):
-            # Already applied (confirmed), or the lesson is already delivered and the
-            # hold is owed to the capture flow (completed). A redelivered or late
-            # success is a no-op — critically, a completed booking's held hold must
-            # never be torn down and released, or the tutor loses a captured lesson.
+            # Already applied, or the hold is owed to a capture still in flight. A
+            # redelivered or late success is a no-op — critically, such a hold must never
+            # be torn down and released, or the tutor loses money they have earned.
             payment.status = Payment.Status.HELD  # keep the passed instance in sync
             return
 

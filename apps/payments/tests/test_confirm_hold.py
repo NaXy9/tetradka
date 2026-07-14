@@ -94,6 +94,38 @@ def test_confirm_hold_is_a_noop_for_a_completed_booking():
     assert not payment.transitions.exists()
 
 
+def test_confirm_hold_is_a_noop_for_a_late_cancelled_booking_awaiting_partial_capture():
+    # A student cancelling late forfeits part of the price: the penalty is pinned onto
+    # the payment when the booking is cancelled and captured only after commit, so in
+    # between the hold sits held under an already-cancelled booking. A late or duplicate
+    # hold_succeeded landing in that window must leave it alone — releasing it as an
+    # orphan would refund the student in full and rob the tutor of the penalty.
+    booking, payment = _pending_with_created_payment()
+    Booking.objects.filter(pk=booking.pk).update(status=BS.CANCELLED_BY_STUDENT)
+    Payment.objects.filter(pk=payment.pk).update(status=PS.HELD, retained_amount=Decimal("750.00"))
+    payment.refresh_from_db()
+
+    confirm_hold(payment)  # must not raise
+
+    payment.refresh_from_db()
+    assert payment.status == PS.HELD  # untouched, ready for the partial capture
+    assert payment.retained_amount == Decimal("750.00")
+    assert not payment.transitions.exists()
+
+
+def test_confirm_hold_rejects_a_late_cancelled_booking_with_nothing_retained():
+    # The mirror of the case above: a cancellation that retained nothing (a full-refund
+    # policy) leaves the hold backing no one, so it stays a genuine orphan the caller
+    # must release.
+    booking, payment = _pending_with_created_payment()
+    Booking.objects.filter(pk=booking.pk).update(status=BS.CANCELLED_BY_STUDENT)
+    Payment.objects.filter(pk=payment.pk).update(status=PS.HELD)
+    payment.refresh_from_db()
+
+    with pytest.raises(HoldNotConfirmable):
+        confirm_hold(payment)
+
+
 @pytest.mark.parametrize("booking_status", [BS.CANCELLED_BY_STUDENT, BS.CONFIRMED])
 def test_confirm_hold_rejects_a_non_pending_booking(booking_status):
     # A hold that confirms after the booking already left pending (timed out, or

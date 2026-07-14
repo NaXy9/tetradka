@@ -564,3 +564,53 @@ def test_cancel_and_confirm_hold_never_leave_an_incoherent_pair():
     # left backing a dead booking.
     assert booking.status == BS.CANCELLED_BY_STUDENT
     assert payment.status in (PS.REFUNDED, PS.FAILED)
+
+
+@pytest.mark.postgres
+@pytest.mark.django_db(transaction=True)
+def test_late_cancel_and_confirm_hold_never_release_the_retained_penalty():
+    # The partial-capture twin of the race above: a student cancels late (50% policy, 1h
+    # ahead) at the same instant a hold_succeeded webhook lands. The cancellation pins
+    # the penalty and leaves the hold held for the async partial capture, so the webhook
+    # meets a held payment under an already-cancelled booking — which must NOT be read as
+    # an orphan. Both writes (booking transition + retained_amount) commit in one
+    # transaction, so the webhook can never observe a cancelled booking with the penalty
+    # not yet pinned; the hold therefore survives for the capture either way.
+    # PostgreSQL-only: SQLite ignores select_for_update, so no real lock forms.
+    booking, payment = _confirmed_with_held_payment(
+        hours_ahead=1, price="1500.00", refund_percent=50
+    )
+    barrier = threading.Barrier(2)
+
+    def cancel():
+        try:
+            barrier.wait(timeout=10)
+            cancel_booking(booking=booking, actor=booking.student)
+        except BookingNotCancellableError:
+            pass  # not expected on this confirmed→cancelled_by_student path
+        finally:
+            connection.close()
+
+    def confirm():
+        try:
+            barrier.wait(timeout=10)
+            services.confirm_hold(payment)
+        except services.HoldNotConfirmable:
+            pass  # would mean the hold was read as an orphan; asserted against below
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=cancel), threading.Thread(target=confirm)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    booking.refresh_from_db()
+    payment.refresh_from_db()
+    assert booking.status == BS.CANCELLED_BY_STUDENT
+    # The money invariant: the penalty is pinned and its hold is still held, awaiting the
+    # partial capture. A failed/refunded payment here would mean the webhook released a
+    # hold the tutor had already earned.
+    assert payment.retained_amount == Decimal("750.00")
+    assert payment.status == PS.HELD

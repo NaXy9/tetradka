@@ -31,7 +31,13 @@ class _RecordingProvider:
         return None
 
 
-def _payment(*, booking_status=BS.PENDING, payment_status=PS.CREATED, provider_id="mock-hold-1"):
+def _payment(
+    *,
+    booking_status=BS.PENDING,
+    payment_status=PS.CREATED,
+    provider_id="mock-hold-1",
+    retained=Decimal("0"),
+):
     booking = BookingFactory(status=booking_status, price=Decimal("1500.00"))
     payment = Payment.objects.create(
         booking=booking,
@@ -39,6 +45,7 @@ def _payment(*, booking_status=BS.PENDING, payment_status=PS.CREATED, provider_i
         provider_id=provider_id,
         amount=booking.price,
         status=payment_status,
+        retained_amount=retained,
     )
     return booking, payment
 
@@ -94,6 +101,31 @@ def test_late_hold_succeeded_on_cancelled_booking_releases_the_hold(
     assert payment.status == PS.FAILED
     assert booking.status == cancelled  # the booking is not resurrected
     assert provider.released == [("mock-hold-1", f"release-{payment.id}")]
+
+
+def test_late_hold_succeeded_does_not_release_a_pinned_late_cancellation_penalty(
+    monkeypatch, django_capture_on_commit_callbacks
+):
+    # The counterpart of the release case above: a late student cancellation keeps its
+    # hold held until the pinned penalty is captured, so a hold_succeeded arriving in
+    # that window backs a real claim and must not be torn down. Releasing it would
+    # refund the student in full and lose the tutor the penalty, silently — the partial
+    # capture that runs next would find the payment no longer held and do nothing.
+    booking, payment = _payment(
+        booking_status=BS.CANCELLED_BY_STUDENT,
+        payment_status=PS.HELD,
+        retained=Decimal("750.00"),
+    )
+    provider = _RecordingProvider()
+    monkeypatch.setattr(services, "get_payment_provider", lambda: provider)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        services.handle_webhook_event(_event(WebhookType.HOLD_SUCCEEDED))
+
+    payment.refresh_from_db()
+    assert payment.status == PS.HELD  # still owed to the partial capture
+    assert payment.retained_amount == Decimal("750.00")
+    assert provider.released == []
 
 
 def test_hold_failed_fails_a_created_payment():
