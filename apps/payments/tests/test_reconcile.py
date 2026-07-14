@@ -10,12 +10,14 @@ the provider releases the rest to the student.
 
 import datetime as dt
 import threading
+import time
 from decimal import Decimal
 
 import pytest
 from django.db import connection, transaction
 from django.utils import timezone
 
+from apps.bookings import services as booking_services
 from apps.bookings.models import Booking
 from apps.bookings.services import (
     PENDING_PAYMENT_TIMEOUT,
@@ -568,35 +570,55 @@ def test_cancel_and_confirm_hold_never_leave_an_incoherent_pair():
 
 @pytest.mark.postgres
 @pytest.mark.django_db(transaction=True)
-def test_late_cancel_and_confirm_hold_never_release_the_retained_penalty():
-    # The partial-capture twin of the race above: a student cancels late (50% policy, 1h
-    # ahead) at the same instant a hold_succeeded webhook lands. The cancellation pins
-    # the penalty and leaves the hold held for the async partial capture, so the webhook
-    # meets a held payment under an already-cancelled booking — which must NOT be read as
-    # an orphan. Both writes (booking transition + retained_amount) commit in one
-    # transaction, so the webhook can never observe a cancelled booking with the penalty
-    # not yet pinned; the hold therefore survives for the capture either way.
+def test_late_cancel_and_confirm_hold_never_release_the_retained_penalty(monkeypatch):
+    # The partial-capture twin of the race above: a hold_succeeded webhook lands while a
+    # student's late cancellation (50% policy, 1h ahead) is in flight. The cancellation
+    # pins the penalty and leaves the hold held for the async partial capture, so the
+    # webhook meets a held payment under an already-cancelled booking — which must NOT be
+    # read as an orphan and released, or the tutor loses the penalty.
+    #
+    # The interleaving is forced rather than raced for: the webhook path is a short read,
+    # so a plain barrier lets it finish long before the cancellation commits and it only
+    # ever sees the booking still confirmed — the uninteresting ordering, which passes even
+    # against the bug this test guards. Instead the cancellation signals once it holds the
+    # booking row lock and lingers there, so the webhook thread blocks on that lock inside
+    # confirm_hold and wakes on committed state. That is the real PostgreSQL lock path, and
+    # it is the ordering that used to lose money.
+    #
+    # The capture is stubbed out to hold the window open: tasks run eagerly in tests, so a
+    # live capture would settle the hold the instant the cancellation commits, hiding the
+    # state under test. The capture itself is covered by the tests above.
     # PostgreSQL-only: SQLite ignores select_for_update, so no real lock forms.
     booking, payment = _confirmed_with_held_payment(
         hours_ahead=1, price="1500.00", refund_percent=50
     )
-    barrier = threading.Barrier(2)
+    monkeypatch.setattr(services, "_enqueue_partial_capture", lambda payment_id: None)
+
+    penalty_pinned = threading.Event()
+    reconcile = booking_services.reconcile_booking_payment
+
+    def reconcile_then_hold_the_lock(**kwargs):
+        reconcile(**kwargs)
+        # Still inside cancel_booking's transaction, holding the booking row lock: wake the
+        # webhook thread and linger so it blocks on that lock rather than racing ahead.
+        penalty_pinned.set()
+        time.sleep(0.3)
+
+    monkeypatch.setattr(booking_services, "reconcile_booking_payment", reconcile_then_hold_the_lock)
 
     def cancel():
         try:
-            barrier.wait(timeout=10)
             cancel_booking(booking=booking, actor=booking.student)
-        except BookingNotCancellableError:
-            pass  # not expected on this confirmed→cancelled_by_student path
         finally:
             connection.close()
 
     def confirm():
         try:
-            barrier.wait(timeout=10)
-            services.confirm_hold(payment)
-        except services.HoldNotConfirmable:
-            pass  # would mean the hold was read as an orphan; asserted against below
+            penalty_pinned.wait(timeout=10)
+            # The webhook seam, not confirm_hold: an orphaned hold is torn down by the
+            # _fail_and_release fallback here, so calling confirm_hold directly would let
+            # a regression pass unnoticed — it only raises, it never releases.
+            services._on_hold_succeeded(payment)
         finally:
             connection.close()
 
@@ -610,7 +632,7 @@ def test_late_cancel_and_confirm_hold_never_release_the_retained_penalty():
     payment.refresh_from_db()
     assert booking.status == BS.CANCELLED_BY_STUDENT
     # The money invariant: the penalty is pinned and its hold is still held, awaiting the
-    # partial capture. A failed/refunded payment here would mean the webhook released a
-    # hold the tutor had already earned.
+    # partial capture. A failed or refunded payment here would mean the webhook tore down
+    # a hold the tutor had already earned.
     assert payment.retained_amount == Decimal("750.00")
     assert payment.status == PS.HELD
