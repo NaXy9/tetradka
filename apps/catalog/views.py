@@ -2,6 +2,7 @@
 
 import datetime as dt
 
+from django.db import transaction
 from django.db.models import Prefetch
 from django.utils.dateparse import parse_datetime
 from django_filters.rest_framework import DjangoFilterBackend
@@ -10,9 +11,11 @@ from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import filters, generics, permissions, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
+from rest_framework.request import Request
 from rest_framework.response import Response
 
 from apps.bookings.services import free_slots
+from apps.common.permissions import IsTutor
 
 from .filters import TutorFilter
 from .models import Subject, TutorProfile, TutorSubject
@@ -21,6 +24,8 @@ from .serializers import (
     SubjectSerializer,
     TutorDetailSerializer,
     TutorListSerializer,
+    TutorProfileSelfSerializer,
+    TutorSubjectManageSerializer,
 )
 
 # Upper bound on the from/to span, so a single public request cannot force the
@@ -145,3 +150,70 @@ class TutorViewSet(viewsets.ReadOnlyModelViewSet):
         start, end = _parse_utc_range(request.query_params)
         slots = [{"starts_at": s, "ends_at": e} for s, e in free_slots(tutor, start, end)]
         return Response(SlotSerializer(slots, many=True).data)
+
+
+class TutorProfileSelfView(generics.RetrieveUpdateAPIView):
+    """GET/PATCH /tutor/profile — the caller's own editable tutor profile.
+
+    Setting a positive hourly_rate here is what makes an onboarding tutor
+    visible in the public catalog.
+    """
+
+    permission_classes = [IsTutor]
+    serializer_class = TutorProfileSelfSerializer
+    # PUT is intentionally not exposed: partial updates only, matching /me.
+    http_method_names = ["get", "patch", "head", "options"]
+
+    def get_object(self) -> TutorProfile:
+        return self.request.user.tutor_profile
+
+
+class TutorSubjectViewSet(viewsets.ModelViewSet):
+    """CRUD under /tutor/subjects for the subjects the caller teaches.
+
+    Every action is scoped to the caller's own profile, so another tutor's row
+    id is a 404 (never a 403 that would confirm it exists), and `tutor` is set
+    from the request user rather than trusted from the body. The onboarding UI
+    loads the whole list at once, hence no pagination.
+    """
+
+    permission_classes = [IsTutor]
+    serializer_class = TutorSubjectManageSerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):  # schema generation has no user
+            return TutorSubject.objects.none()
+        return TutorSubject.objects.filter(tutor=self.request.user.tutor_profile).select_related(
+            "subject"
+        )
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if not getattr(self, "swagger_fake_view", False):
+            context["tutor"] = self.request.user.tutor_profile
+        return context
+
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        with transaction.atomic():
+            self._lock_own_profile()
+            return super().create(request, *args, **kwargs)
+
+    def update(self, request: Request, *args, **kwargs) -> Response:
+        with transaction.atomic():
+            self._lock_own_profile()
+            return super().update(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        serializer.save(tutor=self.request.user.tutor_profile)
+
+    def _lock_own_profile(self) -> None:
+        """Serialize a tutor's concurrent subject writes on their profile row.
+
+        Two concurrent creates of the same (subject, level) could each pass the
+        serializer's duplicate check against stale state; one would then hit the
+        unique constraint and 500. Locking the profile row makes the
+        check-then-write see committed state, leaving the DB constraint as a
+        backstop. A no-op on SQLite; the real serialization point on PostgreSQL.
+        """
+        TutorProfile.objects.select_for_update().get(pk=self.request.user.tutor_profile.pk)

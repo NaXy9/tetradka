@@ -12,7 +12,7 @@ class IsTutor(BasePermission):
     the hasattr check costs at most one query per request.
     """
 
-    message = "Only tutors may manage availability."
+    message = "Only tutors may access this resource."
 
     def has_permission(self, request, view) -> bool:
         user = request.user

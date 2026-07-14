@@ -31,6 +31,82 @@ class TutorSubjectSerializer(serializers.ModelSerializer):
         fields = ["name", "slug", "level"]
 
 
+class TutorProfileSelfSerializer(serializers.ModelSerializer):
+    """The tutor's own editable profile (GET/PATCH /tutor/profile).
+
+    Onboarding starts at ``hourly_rate = 0``, which keeps the profile hidden
+    from the public catalog; setting a positive rate is what publishes the
+    tutor. Denormalized stats, the verification flag and the cancellation
+    policy are read-only here — the latter feeds refund maths and is changed
+    through a dedicated flow, not free-form profile edits.
+    """
+
+    subjects = TutorSubjectSerializer(source="tutor_subjects", many=True, read_only=True)
+
+    class Meta:
+        model = TutorProfile
+        fields = [
+            "id",
+            "bio",
+            "hourly_rate",
+            "education",
+            "experience_years",
+            "video_intro_url",
+            "late_cancellation_refund_percent",
+            "is_verified",
+            "rating",
+            "lessons_count",
+            "balance",
+            "subjects",
+        ]
+        read_only_fields = [
+            "id",
+            "late_cancellation_refund_percent",
+            "is_verified",
+            "rating",
+            "lessons_count",
+            "balance",
+            "subjects",
+        ]
+
+
+class TutorSubjectManageSerializer(serializers.ModelSerializer):
+    """A subject the authenticated tutor teaches, for self-service management.
+
+    `subject` is writable by id and echoed back with its name/slug; `tutor` is
+    taken from the request, never the body, so a tutor edits only their own
+    rows. `level` is a free-text teaching level (exam prep, conversational, ...).
+    """
+
+    subject = serializers.PrimaryKeyRelatedField(queryset=Subject.objects.all())
+    name = serializers.CharField(source="subject.name", read_only=True)
+    slug = serializers.SlugField(source="subject.slug", read_only=True)
+
+    class Meta:
+        model = TutorSubject
+        fields = ["id", "subject", "name", "slug", "level"]
+
+    def validate(self, attrs: dict) -> dict:
+        # On a partial update the omitted fields keep their stored values, so
+        # the full resulting (subject, level) pair is checked, not just the part
+        # being changed.
+        subject = attrs.get("subject", getattr(self.instance, "subject", None))
+        level = attrs.get("level", getattr(self.instance, "level", "") or "")
+        self._reject_duplicate(subject, level)
+        return attrs
+
+    def _reject_duplicate(self, subject: Subject, level: str) -> None:
+        # A friendly 400 for the common case; the (tutor, subject, level) unique
+        # constraint is the last line of defense against a concurrent duplicate.
+        existing = TutorSubject.objects.filter(
+            tutor=self.context["tutor"], subject=subject, level=level
+        )
+        if self.instance is not None:
+            existing = existing.exclude(pk=self.instance.pk)
+        if existing.exists():
+            raise serializers.ValidationError("You already teach this subject at this level.")
+
+
 class ReviewSerializer(serializers.ModelSerializer):
     # Only the student's first name is exposed: reviews are public, full
     # identity of the reviewer is not.
